@@ -43,14 +43,18 @@ from gateway.session import build_session_key
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 LATCH_URL = "https://plow.co/latch"
 DASHBOARD_URL = "https://app.plow.co/dashboard"
+# Hermes' own diagnostics reach the adapter through plain send() carrying no
+# metadata that tells them apart from the model's prose, so they are still
+# recognised by the text they open with. The room carve-out below must not
+# reach them: they are the runtime talking about itself, never the turn's
+# answer, so withholding one can never withhold the message the owner wanted.
 BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
+_WORKING_PREFIX = "⏳ Working —"
 # TODO(remove): once the fleet image pin includes srosro/hermes-agent's
 # turn-stop-status PR, turn-stop text arrives as status frames and this
 # final-response shim is dead code.
 _NO_REPLY_PREFIX = "⚠️ No reply: "
-# Upstream's long-running heartbeat rides plain send(), not
-# send_or_update_status, so the one verbose preference has to gate it here.
-_WORKING_PREFIX = "⏳ Working —"
+_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
@@ -733,13 +737,17 @@ REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
     "plow_send_message tool and will be refused on an external turn."
 )
-# Hermes reads the model's LAST message as the turn's final response.
-# Suppressing mid-turn delivery instead lost the intended answer in live
-# trials -- twice; see README and plow-pbc/hermes-plow-chat#89 -- so the
-# ordering is asked for here rather than enforced at the delivery seam.
+# Hermes reads the model's LAST message as the turn's final response, and that
+# is the one message the delivery gate can recognise. Quiet withholds the rest
+# in rooms with a third party in them, but the gate cannot tell an answer
+# written mid-turn from the working-out around it -- withholding on that guess
+# lost the intended answer in live trials, twice; see README and
+# plow-pbc/hermes-plow-chat#89. So the ordering is asked for here rather than
+# inferred there, and it is what keeps the answer out of the withheld set.
 _ANSWER_LAST = (
-    "Write your answer LAST. Every message you write reaches this chat as you "
-    "write it, and whatever you write last is what this turn is read as. "
+    "Write your answer LAST. Whatever you write last is what this turn is "
+    "read as, and it is the one message certain to reach this chat -- anything "
+    "you write before it may be withheld as working-out. "
     "Finish the tool calls you need -- recording an outcome, saving a note to "
     "yourself, any bookkeeping -- BEFORE the message you want read, never "
     "after it. A tool that POSTS to this chat is the exception: when one "
@@ -1448,6 +1456,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         A provider that raises is a notice that did not land, not a reason to
         abandon the transition mid-flight: an escaping exception leaves the
         pacing stopped and the goal with no task to re-fire or retire it.
+        Sent notify-marked: a `/goal` reply and a goal's own activation,
+        exhaustion or expiry notice are the goal subsystem's answer, not a
+        turn's mid-turn chatter, so the verbose preference must not gate them.
         """
         try:
             result = await self.send(chat_uid, text)
@@ -1760,13 +1771,58 @@ class PlowChatAdapter(BasePlatformAdapter):
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
+        # The turn boundary is the classifier: prose the model writes while a
+        # turn is open, into that turn's own chat, is its working-out. Hermes
+        # marks the turn-final reply `notify` -- the key telegram, discord,
+        # mattermost and a2a already read for the same distinction -- and the
+        # scheduler marks a cron delivery `job_id`. Everything the adapter
+        # itself sends (the greeting, a goal notice, the send_message tool)
+        # runs turn-less or cross-chat, so it falls out as not-chatter
+        # without needing to say so.
+        meta = metadata or {}
+        chatter = (turn is not None and chat_id == turn["chat_uid"]
+                   and not meta.get("notify") and "job_id" not in meta)
+        # Matched on text because Hermes gives these no metadata of their own:
+        # the heartbeat and the memory notice arrive unmarked, and the
+        # turn-stop explainer arrives `notify`-marked because Hermes
+        # substitutes it AS final_response -- so the metadata predicate calls
+        # one batch chatter and the other an answer, and neither reading is
+        # what the preference means by a diagnostic.
+        diagnostic = body.startswith(_DIAGNOSTIC_PREFIXES)
+        # Withheld only where withholding is worth its own risk. The seam
+        # cannot tell the model's answer from its working-out, so suppressing
+        # chatter can suppress the answer with it -- a real cost, paid only in
+        # the rooms that earn it. A room with somebody else in it earns it:
+        # that is where an errand published a cart, a shipping address and a
+        # card, and where a lost answer costs a re-ask rather than a
+        # disclosure. The owner's own 1:1 has no third party, so nothing is
+        # withheld there and the answer cannot go missing.
+        #
+        # Dropped, not buffered: a turn-end flush of the last withheld body was
+        # tried and removed, because picking "the last one" is the same guess
+        # the seam cannot make -- see the README's delivery-contract section,
+        # which records the same conclusion from two earlier attempts.
+        #
+        # Hermes' own diagnostics stay gated in EVERY room, carve-out included.
+        # They are the runtime describing itself, so withholding one can never
+        # withhold the turn's answer, and the room rule exists only to protect
+        # the answer. Letting them ride the carve-out would hand a quiet owner
+        # the heartbeat and the memory notice in their own DM -- the two the
+        # base image's seed deliberately produces for this gate to decide.
+        #
+        # .get, not indexing: a chat can be inside the grant without its
+        # resource cached -- a cross-chat send reaches one this adapter
+        # never listed. An unknown room is not the owner's 1:1, so the
+        # empty default withholds, which is the direction that cannot
+        # disclose.
+        withhold = diagnostic or (chatter and not _owner_dm(self._chats.get(chat_id, {})))
         async with aiohttp.ClientSession() as http:
-            if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX, _WORKING_PREFIX)):
-                if not await self._verbose_enabled(http):
-                    # Dropped before touching typing: a frame the owner never
-                    # sees must not eat the "working" signal either.
-                    log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
-                    return SendResult(success=True)
+            if withhold and not await self._verbose_enabled(http):
+                # Before typing is touched: a message the owner never sees must
+                # not eat the "working" signal either.
+                log.info("[plow_chat] dropped %s for %s",
+                         "diagnostic" if diagnostic else "mid-turn chatter", chat_id)
+                return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
         if result.success:
             # Only once it lands: text that never reached the thread is not
@@ -2339,7 +2395,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         file is the durable record of having met this chat, so it rides
         whichever baseline write creates it -- an in-memory latch re-greeted
         every granted chat on every gateway restart, a wave of noise into
-        real rooms."""
+        real rooms. Sent notify-marked: this is the adapter's own structural
+        disclosure, not a turn's mid-turn chatter -- there may be no turn open
+        at all -- so the verbose preference must not gate it."""
         if not first_meeting:
             return
         try:
@@ -3238,7 +3296,11 @@ def _plow_send_message(args, **_kwargs):
 
     The adapter's send() is the authority on reach: outside the grant, or a
     cross-chat send during a member's turn, comes back refused and is
-    relayed as-is. Nothing here is a second gate."""
+    relayed as-is. Nothing here is a second gate. Sent notify-marked: this is
+    a deliberate agent action on a tool call, not a turn's mid-turn chatter --
+    it also runs on another thread via run_coroutine_threadsafe, where
+    self._active_turn.get() reads None, so an unmarked send here would be
+    held nowhere and just silently never leave while still reporting success."""
     chat_id = (args.get("chat_id") or "").strip()
     body = (args.get("body") or "").strip()
     if not chat_id or not body:
@@ -3248,7 +3310,9 @@ def _plow_send_message(args, **_kwargs):
                            "error": "the Plow Chat gateway is not connected; nothing was sent"})
     adapter, loop = _live
     try:
-        result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
+        result = asyncio.run_coroutine_threadsafe(
+            adapter.send(chat_id, body), loop
+        ).result(timeout=45)
     except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
         return _lost_answer(exc)
     if not result.success:
