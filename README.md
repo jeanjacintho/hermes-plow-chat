@@ -114,54 +114,27 @@ turn-stop warnings — is dropped unless the credential's
 `verbose_output_enabled` preference (the dashboard's "Verbose agent output"
 toggle) is true; the typing indicator already shows the turn is running.
 
-The same preference decides how much of a turn the room reads. Hermes gates the
-model's mid-turn commentary on
-`display.platforms.<platform>.interim_assistant_messages`, re-read from
-`config.yaml` at the start of every turn — the setting that puts its own
-iMessage adapters (photon, bluebubbles) in `display_config._TIER_LOW`. A plugin
-platform is in no tier and inherits the chattier global default, so an errand in
-a group posted twenty-five lines of working-out — "Now selecting Credit/Debit
-Card", "Found Submit Payment", "Button is disabled" — before the one message
-that mattered.
+**The answer goes last, and that is a prompt rule because it cannot be a
+delivery one.** Everything the model writes reaches the room as it writes it,
+and Hermes reads whatever it wrote *last* as the turn's final response. The
+model's habit is to write its real message, call one more tool — recording an
+outcome, per the variant personas — and then write itself a note, so the note
+lands as the answer and the message reads as chatter.
 
-That key is static config and knows nothing of a per-credential preference, so
-the plugin points it at the live answer: on connect, and at each turn boundary,
-`verbose_output_enabled` is read and written into `config.yaml` when it differs.
-Quiet keeps the working-out inside the turn and lets only the answer reach the
-room; verbose restores the running commentary.
+Suppressing mid-turn delivery is the remedy that does not work, and it has now
+been tried twice. `plow-hermes-agent`'s seed config records the first attempt,
+measured live: a whole onboarding introduction disappeared and the owner's turn
+became *"Already saved that. Now I'll wait for her next reply."* Holding
+messages and flushing the last one fails identically — the note is what arrives
+last. The delivery seam cannot tell an answer from a note, so the ordering is
+the model's to get right, and `_ANSWER_LAST` closes every channel prompt asking
+for it — appended once in `_channel_prompt`, the one seam both production
+paths go through, after the identity opener each prompt has to start with.
 
-**On an inbound turn the write lands on the turn it runs on, not the next
-one.** Hermes awaits the `on_processing_start` hook immediately before the
-message handler (`gateway/platforms/base.py`), and resolves the turn's display
-config further down inside `_run_agent_inner` — so the write precedes the read,
-and the mtime-keyed raw-yaml cache the loader shares is invalidated by the
-atomic replace. A toggle flipped between turns applies to the very next
-message.
-
-**A cron delivery is the exception, and reads the last synced value.** A cron
-producer reaches the agent through the gateway's own handler rather than this
-adapter's inbound path, so it never runs that hook. Every connect —
-*reconnects included* — re-syncs, which is what bounds how stale that value can
-get; a toggle flipped between an inbound turn and a cron run reaches the cron
-run only once something has re-synced.
-
-A failed preference read changes nothing at all. It resolves to *unknown*
-rather than to quiet, so a blinking preferences endpoint cannot flip a setting
-the owner chose in either direction — it leaves whatever was last written and
-the turn proceeds.
-
-The staged file is created at the config's own mode before any content is
-written, following the `mkstemp` + `fchmod` ordering `agent-mgr`'s own
-`atomic_write` uses on this same file. `agent-mgr` installs it 0600 and the
-fleet runs it 0640, so writing first and restricting after would expose the
-whole gateway configuration at the umask's 0644 for the length of every write.
-
-Writing a gateway key from here is deliberate. The base image owns the config
-*seed* — the static default every agent boots with; what reaches the room on a
-given turn is this plugin's concern, and this key is the only lever the runtime
-offers for it. A failed read or an unwritable config is logged and dropped: the thread
-retains its last-synced verbosity until a later successful read, and the turn
-is never dropped.
+One exception rides with it: a tool that *posts* to the chat is itself the
+answer. A successful `plow_send_sequence` has already delivered the turn's
+reply, so the guard drops the prose that follows — the rule says so, or a
+model that finished its tools first would have its answer suppressed.
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
