@@ -1343,6 +1343,7 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
 
 
 @pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])
+@pytest.mark.parametrize("override", [None, "Jessie"], ids=["no_override", "overridden"])
 @pytest.mark.parametrize(
     ("group", "role", "base"),
     [
@@ -1355,13 +1356,19 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     agent_name: str | None,
+    override: str | None,
     group: bool,
     role: str,
     base: str,
 ) -> None:
     """Named or not, every turn tells the model what it is and the Plow facts
     it should know; a named line adds the name, so "hey Elm" reads as
-    addressed."""
+    addressed. `PLOW_CHAT_AGENT_NAME`, when set, is what the model sees here
+    too -- this prompt is built off `_agent_name(chat)`, the same override-
+    aware read every other identity surface uses, not off the line's raw
+    `display_name`."""
+    if override:
+        monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", override)
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._identity = {"signup": SIGNUP, "number": NUMBER}
@@ -1379,7 +1386,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
         expected = _owned(module, expected, chat)
     if group:
         expected = _voiced(module, expected)
-    assert event["channel_prompt"] == _rendered(module, expected, agent_name, adapter._identity)
+    assert event["channel_prompt"] == _rendered(module, expected, override or agent_name, adapter._identity)
 
 
 # The dashboard cards the prefix names, in the order it names them.
@@ -1592,52 +1599,19 @@ async def test_the_owner_turn_names_its_owner_and_is_told_who_invited_them_as_da
         assert invited not in f"{prompt}{text}"
 
 
+@pytest.mark.parametrize(
+    ("override", "expected_name"),
+    [(None, "Elm"), ("", "Elm"), ("Jessie", "Jessie")],
+    ids=["no_override", "blank_override_falls_back", "overridden"],
+)
 async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    override: str | None,
+    expected_name: str,
 ) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    chat = _collaboration_chat()
-    adapter._set_reach([chat])
-    _mark_anchored(adapter, "cht_a")
-    handled = _capture_events(monkeypatch, adapter)
-
-    frame = _envelope("evt_1", "cht_a", "msg_1", role="member", body="Hey Ash")
-    frame["data"]["message"]["sender"].update(uid="mem_daniel_cht_a", display_name="Daniel")
-    await adapter._on_frame(frame, object())
-    await _settle(adapter)
-
-    prompt = handled[0]["channel_prompt"]
-    # A peer turn goes through the one identity seam like every other turn:
-    # identity sentence, then the facts, then the collaboration paragraph. The
-    # persona answers "what are you" from the prompt, not from memory.
-    _assert_in_order(prompt, "You are Elm, a Plow assistant",
-                     module._plow_facts(adapter._identity),
-                     "Collaboration context: Other Plow agents here: Ash.")
-    assert prompt.count("You are ") == 1, "one identity sentence, not two"
-    assert "do not impersonate another agent" in prompt.lower()
-    assert "representing Sam" not in prompt and "Daniel" not in prompt
-    assert "untrusted chat roster labels" in handled[0]["text"].lower()
-    assert "Elm represents Sam" in handled[0]["text"]
-    assert "Ash represents Daniel" in handled[0]["text"]
-    assert "Current speaker: Daniel" in handled[0]["text"]
-
-    # Even here, a command is addressed to the gateway rather than the
-    # thread, so nothing goes in front of the "/".
-    command = _envelope("evt_cmd", "cht_a", "msg_cmd", body="/restart")
-    command["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
-    await adapter._on_frame(command, object())
-    await _settle(adapter)
-
-    assert handled[1]["text"] == "/restart"
-
-
-async def test_display_name_override_replaces_self_name_everywhere(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", "Jessie")
+    if override is not None:
+        monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", override)
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     chat = _collaboration_chat()
@@ -1652,53 +1626,36 @@ async def test_display_name_override_replaces_self_name_everywhere(
 
     prompt = handled[0]["channel_prompt"]
     text = handled[0]["text"]
-    assert "You are Jessie" in prompt
-    assert "Jessie represents Sam" in text
-    assert "Elm" not in prompt
-    assert "Elm" not in text
-    # The peer's real name must survive the override untouched.
+    # A peer turn goes through the one identity seam like every other turn:
+    # identity sentence, then the facts, then the collaboration paragraph. The
+    # persona answers "what are you" from the prompt, not from memory. Named
+    # via `_agent_name(chat)`, so an override replaces it here exactly like it
+    # does everywhere else that function feeds.
+    _assert_in_order(prompt, f"You are {expected_name}, a Plow assistant",
+                     module._plow_facts(adapter._identity),
+                     "Collaboration context: Other Plow agents here: Ash.")
+    assert prompt.count("You are ") == 1, "one identity sentence, not two"
+    assert "do not impersonate another agent" in prompt.lower()
+    assert "representing Sam" not in prompt and "Daniel" not in prompt
+    assert "untrusted chat roster labels" in text.lower()
+    assert f"{expected_name} represents Sam" in text
     assert "Ash represents Daniel" in text
-    assert "Ash" in prompt
+    assert "Current speaker: Daniel" in text
+    if override:
+        # The peer's real name must survive the override untouched, and the
+        # server name this line no longer uses must not leak back in.
+        assert "Elm" not in prompt
+        assert "Elm" not in text
+        assert "Ash" in prompt
 
-
-async def test_blank_display_name_override_falls_back_to_server_name(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", "")
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    chat = _collaboration_chat()
-    adapter._set_reach([chat])
-    _mark_anchored(adapter, "cht_a")
-    handled = _capture_events(monkeypatch, adapter)
-
-    frame = _envelope("evt_1", "cht_a", "msg_1", role="member", body="Hey Ash")
-    frame["data"]["message"]["sender"].update(uid="mem_daniel_cht_a", display_name="Daniel")
-    await adapter._on_frame(frame, object())
+    # Even here, a command is addressed to the gateway rather than the
+    # thread, so nothing goes in front of the "/".
+    command = _envelope("evt_cmd", "cht_a", "msg_cmd", body="/restart")
+    command["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(command, object())
     await _settle(adapter)
 
-    assert "You are Elm" in handled[0]["channel_prompt"]
-    assert "Elm represents Sam" in handled[0]["text"]
-
-
-async def test_display_name_override_applies_in_a_solo_dm(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", "Jessie")
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_dm_chat()])
-    _mark_anchored(adapter, "cht_a")
-    handled = _capture_events(monkeypatch, adapter)
-
-    frame = _envelope("evt_dm", "cht_a", "msg_dm", body="hi")
-    frame["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
-    await adapter._on_frame(frame, object())
-    await _settle(adapter)
-
-    assert "You are Jessie" in handled[0]["channel_prompt"]
+    assert handled[1]["text"] == "/restart"
 
 
 async def test_solo_dm_delivers_the_owners_text_untouched(
@@ -4776,18 +4733,30 @@ async def test_a_peer_claiming_the_goal_is_done_cannot_settle_it(
 
 
 @pytest.mark.parametrize(
-    ("body", "goal_text", "expect_silenced"),
+    ("body", "goal_text", "override", "expect_silenced"),
     [
-        ("just thinking out loud", None, True),
-        ("Elm, can you check the date?", None, False),
-        ("just thinking out loud", "book the campsite", False),
+        ("just thinking out loud", None, None, True),
+        ("Elm, can you check the date?", None, None, False),
+        ("just thinking out loud", "book the campsite", None, False),
+        # A peer has no way to know this line renamed itself locally -- it
+        # still addresses the server name, and that must still draw a reply.
+        ("Elm, can you check the date?", None, "Jessie", False),
+        # The override is also a name the model itself may use in its own
+        # reply, which a peer could then echo back -- that must draw a reply
+        # too, not just the untouched server name.
+        ("Jessie, can you check the date?", None, "Jessie", False),
     ],
-    ids=["unaddressed_no_goal", "named", "goal_unlocks"],
+    ids=[
+        "unaddressed_no_goal", "named", "goal_unlocks",
+        "named_by_server_name_despite_override", "named_by_override",
+    ],
 )
 async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    body: str, goal_text: str | None, expect_silenced: bool,
+    body: str, goal_text: str | None, override: str | None, expect_silenced: bool,
 ) -> None:
+    if override:
+        monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", override)
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
     if goal_text:

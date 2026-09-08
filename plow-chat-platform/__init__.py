@@ -736,13 +736,21 @@ def _goal_peer_should_stay_silent(sender, chat, text, goal):
     what unlocks agent-to-agent traffic, so the dangerous capability is never
     ambient. Reads `type == "agent"`, so it is only as good as peer
     classification (plow-pbc/plow#1741).
+
+    Checks both names this line can be addressed by: `_agent_name(chat)` (the
+    override, if `PLOW_CHAT_AGENT_NAME` is set) and the server's own
+    `display_name`. A peer has no way to know about a local override, so it
+    keeps saying the server name -- checking only the override would read
+    every peer-addressed message as unaddressed and silence a reply that was
+    owed.
     """
     if (sender or {}).get("type") != "agent":
         return False
     if _goal_active(goal):
         return False
-    name = _agent_name(chat)
-    return not (name and name.lower() in (text or "").lower())
+    text_lower = (text or "").lower()
+    names = {n for n in (_agent_name(chat), _self_agent_line(chat).get("display_name")) if n}
+    return not any(name.lower() in text_lower for name in names)
 
 
 def _sender_key(sender):
