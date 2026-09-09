@@ -2653,7 +2653,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
         },
         "question": (
             "Hey! I noticed Taylor loves Plow and isn't a user yet. "
-            "Can I send them a Plow invite—and do that in situations like this on your behalf? "
+            "Can I send them a Plow invite, and do that in situations like this on your behalf? "
             "You'll both get $100 in free API credits. 🙂"
         ),
         "handler_name": "invite-consent",
