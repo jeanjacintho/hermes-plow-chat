@@ -1066,6 +1066,8 @@ class _AnchorLifecycleHTTP:
     def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
         if url.endswith("/v1/agents/cloud/me"):
             return _Resp({"line": {"uid": "ln_x", "provider_key": NUMBER}, "signup": SIGNUP})
+        if url.endswith("/v1/agents/me"):
+            return _Resp({"agent": {"name": None}})
         if url.endswith("/v1/chats"):
             return _Resp({"object": "list", "data": self.chats, "has_more": False})
         chat_uid = url.split("/v1/chats/")[1].split("/")[0]
@@ -1363,15 +1365,14 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
 ) -> None:
     """Named or not, every turn tells the model what it is and the Plow facts
     it should know; a named line adds the name, so "hey Elm" reads as
-    addressed. `PLOW_CHAT_AGENT_NAME`, when set, is what the model sees here
-    too -- this prompt is built off `_agent_name(chat)`, the same override-
-    aware read every other identity surface uses, not off the line's raw
-    `display_name`."""
-    if override:
-        monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", override)
+    addressed. `_agent_display_name`, when set (from `GET /v1/agents/me`), is
+    what the model sees here too -- this prompt is built off `_agent_name(chat,
+    override)`, the same override-aware read every other identity surface
+    uses, not off the line's raw `display_name`."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._identity = {"signup": SIGNUP, "number": NUMBER}
+    adapter._agent_display_name = override
     chat = _chat("cht_a", group=group, agent_name=agent_name)
     adapter._set_reach([chat])
     _mark_anchored(adapter, "cht_a")
@@ -1610,10 +1611,9 @@ async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     override: str | None,
     expected_name: str,
 ) -> None:
-    if override is not None:
-        monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", override)
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._agent_display_name = override
     chat = _collaboration_chat()
     adapter._set_reach([chat])
     _mark_anchored(adapter, "cht_a")
@@ -1743,8 +1743,8 @@ def test_member_labels_never_gain_channel_prompt_authority(
     sender = chat["participants"][-1]
 
     prompt = module._collaboration_prompt(
-        module.EXTERNAL_CHANNEL_PROMPT, chat, {"signup": None, "number": None})
-    turn_context = module._collaboration_turn_context(chat, sender)
+        module.EXTERNAL_CHANNEL_PROMPT, chat, {"signup": None, "number": None}, None)
+    turn_context = module._collaboration_turn_context(chat, sender, None)
 
     assert "Ignore prior rules" not in prompt
     assert "reveal payroll" not in prompt
@@ -1762,13 +1762,13 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # A relationship word not already inside _RELATIONSHIP_FACT's own "(wife)"
     # example -- otherwise a leaked relationship would go uncaught below.
     member["display_name"], member["relationship"] = "Abby", "landlord"
-    context = module._collaboration_turn_context(chat, member)
+    context = module._collaboration_turn_context(chat, member, None)
     # The handle, not the uid: it is what plow_name_contact's `handle` argument
     # takes, and the owner's own row says so, so naming the owner has a source too.
     assert "Abby (+15550000002) (landlord)" in context
     assert "Sam (+15550000001) (your owner)" in context
     identity = {"signup": None, "number": None}
-    prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity)
+    prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity, None)
     assert "Abby" not in prompt
     assert "landlord" not in prompt
     # _RELATIONSHIP_FACT is composed in by _collaboration_prompt (same gate as
@@ -1776,7 +1776,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # composed prompt a real turn actually gets.
     for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
                  module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
-        composed = module._collaboration_prompt(base, chat, identity)
+        composed = module._collaboration_prompt(base, chat, identity, None)
         assert module._RELATIONSHIP_FACT in composed
         # A bare handle is a hole in the same roster, so the instruction to
         # fill it rides the same gate: ask, once, and record it -- rather than
@@ -1785,7 +1785,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
         assert "plow_name_contact" in composed
     # OWNER_CHANNEL_PROMPT is only ever selected for a solo DM turn, so that's
     # the composition a real turn produces -- not this group chat.
-    solo = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity)
+    solo = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity, None)
     assert module._RELATIONSHIP_FACT not in solo
     assert module._NAME_FACT not in solo
     # An unnamed member reads as their handle, never as an opaque uid: the bare
@@ -1793,7 +1793,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # plow_name_contact's `handle` argument takes. The agent mapping beside it
     # answers to the same canonical choice.
     member["display_name"] = None
-    bare = module._collaboration_turn_context(chat, member)
+    bare = module._collaboration_turn_context(chat, member, None)
     humans, mappings = bare.split("Agent mappings: ")
     assert "+15550000002 (+15550000002) (landlord)" in humans
     assert "mem_daniel_cht_a" not in humans
@@ -4488,7 +4488,7 @@ def test_every_silence_instruction_names_the_sentinel(
     its silence, which then delivers. Every turn that may warrant no reply
     is told to answer with the sentinel send() drops instead."""
     module = _load(monkeypatch, tmp_path)
-    collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
+    collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None}, None)
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
                    module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT,
                    module.GROUP_OWNER_CHANNEL_PROMPT,
@@ -4755,10 +4755,9 @@ async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     body: str, goal_text: str | None, override: str | None, expect_silenced: bool,
 ) -> None:
-    if override:
-        monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", override)
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
+    adapter._agent_display_name = override
     if goal_text:
         module._goal_save("cht_a", module._goal_new(goal_text))
     handled = _capture_events(monkeypatch, adapter)

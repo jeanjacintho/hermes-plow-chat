@@ -118,7 +118,12 @@ URL in git.
 | `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
-| `PLOW_CHAT_AGENT_NAME` | no | overrides this line's persona name in every text surface the model sees (collaboration prompt, roster mappings); leaves the server-assigned line name and the iMessage contact card untouched |
+
+The persona name shown to the model is read from `GET /v1/agents/me`'s
+`agent.name` at reach refresh, not from a dotenv var — the owner sets it
+server-side (`PATCH /v1/agents/{uid}`). Falls back to the line's own
+`display_name` when unset; either way, the server-assigned line name and
+the iMessage contact card are untouched.
 
 Diagnostics — agent status frames, 💾 background-review posts, ⏳ long-running
 heartbeats, ⚠️ turn-stop warnings — are dropped in **every** room unless the
