@@ -729,7 +729,7 @@ def _goal_turn_line(record):
 
 
 def _goal_peer_should_stay_silent(sender, chat, text, goal, agent_name):
-    """True when a peer agent's message must not draw a reply.
+    r"""True when a peer agent's message must not draw a reply.
 
     With no active goal an agent answers humans and stays out of the way of
     other agents; being named is the one thing that overrides that. The goal is
@@ -744,9 +744,15 @@ def _goal_peer_should_stay_silent(sender, chat, text, goal, agent_name):
     every peer-addressed message as unaddressed and silence a reply that was
     owed.
 
-    Word-boundary matched, not a bare substring test: a short name like "Al"
-    sits inside plenty of ordinary words ("alternatives"), and a raw
-    substring check would read every one of them as this line being named.
+    Matched with lookaround, not `\b` and not a bare substring test: a short
+    name like "Al" sits inside plenty of ordinary words ("alternatives"), so a
+    raw substring check would read every one of them as this line being named
+    -- but `\b` itself needs a *word* character right at the name's own edge,
+    which a persona name is never guaranteed to have (an owner-set `agent.name`
+    only requires a non-empty string, so "@Jessie", "A.J." or an emoji-only
+    name all have a non-word edge, and `\b` would silently never match them).
+    `(?<!\w)`/`(?!\w)` assert on the surrounding text only, not on the name's
+    own first/last character, so it works for either shape.
     """
     if (sender or {}).get("type") != "agent":
         return False
@@ -754,7 +760,7 @@ def _goal_peer_should_stay_silent(sender, chat, text, goal, agent_name):
         return False
     text_lower = (text or "").lower()
     names = {n for n in (_agent_name(chat, agent_name), _self_agent_line(chat).get("display_name")) if n}
-    return not any(re.search(rf"\b{re.escape(name.lower())}\b", text_lower) for name in names)
+    return not any(re.search(rf"(?<!\w){re.escape(name.lower())}(?!\w)", text_lower) for name in names)
 
 
 def _sender_key(sender):

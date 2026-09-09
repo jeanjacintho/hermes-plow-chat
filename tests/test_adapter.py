@@ -4760,11 +4760,18 @@ async def test_a_peer_claiming_the_goal_is_done_cannot_settle_it(
         # A short name sitting inside an unrelated word ("elm" in "helmet")
         # must not read as addressed -- a bare substring test would.
         ("Where's my helmet?", None, None, True),
+        # A persona name with a non-word edge -- an owner-set agent.name only
+        # requires a non-empty string -- at the very start of the message,
+        # where there is no word character before it either. `\b` needs a
+        # word character right at the name's own edge and would silently
+        # never match this; the lookaround fix does not depend on it.
+        ("@Jessie, can you check the date?", None, "@Jessie", False),
     ],
     ids=[
         "unaddressed_no_goal", "named", "goal_unlocks",
         "named_by_server_name_despite_override", "named_by_override",
         "short_name_is_not_a_substring_match",
+        "persona_name_with_a_non_word_edge",
     ],
 )
 async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
