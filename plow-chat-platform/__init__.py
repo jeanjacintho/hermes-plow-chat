@@ -743,6 +743,10 @@ def _goal_peer_should_stay_silent(sender, chat, text, goal, agent_name):
     keeps saying the server name -- checking only the override would read
     every peer-addressed message as unaddressed and silence a reply that was
     owed.
+
+    Word-boundary matched, not a bare substring test: a short name like "Al"
+    sits inside plenty of ordinary words ("alternatives"), and a raw
+    substring check would read every one of them as this line being named.
     """
     if (sender or {}).get("type") != "agent":
         return False
@@ -750,7 +754,7 @@ def _goal_peer_should_stay_silent(sender, chat, text, goal, agent_name):
         return False
     text_lower = (text or "").lower()
     names = {n for n in (_agent_name(chat, agent_name), _self_agent_line(chat).get("display_name")) if n}
-    return not any(name.lower() in text_lower for name in names)
+    return not any(re.search(rf"\b{re.escape(name.lower())}\b", text_lower) for name in names)
 
 
 def _sender_key(sender):
