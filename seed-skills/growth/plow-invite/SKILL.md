@@ -1,6 +1,6 @@
 ---
 name: plow-invite
-description: When someone who is not your owner praises Plow or asks how to get an agent of their own, offer them one.
+description: When someone who is not your owner shows genuine interest in Plow or asks how to get an agent of their own, offer them one.
 version: 1.5.0
 ---
 
