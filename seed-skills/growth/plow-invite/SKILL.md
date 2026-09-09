@@ -4,14 +4,14 @@ description: When someone who is not your owner praises Plow or asks how to get 
 version: 1.5.0
 ---
 
-# Plow invite — delight-triggered referral
+# Plow invite: delight-triggered referral
 
 <!-- The only hand-edited copy: plow-pbc/hermes-plow-chat
      seed-skills/growth/plow-invite. The base image stages this file out of
      this repo's tarball at the plugin SHA it pins, so there is nothing to copy
      by hand. Configuration comes only from the environment (PLOW_API_BASE /
      PLOW_AGENT_TOKEN) and every path is relative to this skill's own
-     directory — never an absolute home. -->
+     directory, never an absolute home. -->
 
 ## When to act
 
@@ -29,8 +29,8 @@ prompt instead); anyone you have already invited (check your memory first).
 ## What to do
 
 Call `plow_offer_invite`. It takes no arguments: the tool binds the current
-turn to a durable server record, and everything else — the person, the
-message, the phrase, the number, the owner's consent — is the server's.
+turn to a durable server record, and everything else is the server's: the
+person, the message, the phrase, the number, the owner's consent.
 
 Read its result:
 
