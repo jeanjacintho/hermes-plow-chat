@@ -1014,7 +1014,7 @@ TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT = (
 def _plow_facts(identity):
     """What every Plow agent should know about Plow, as prompt prose.
 
-    The signup phrase and this agent's number come from /v1/agents/cloud/me
+    The signup phrase and this agent's number come from /v1/agents/me
     at reach refresh; the URLs are Plow's own. None of it is sender-supplied
     text, so carrying it in the prompt is not the injection seam a sender name
     would be. A deployment whose API serves no signup block simply omits the
@@ -1283,15 +1283,26 @@ class PlowChatAdapter(BasePlatformAdapter):
             if body["has_more"]:
                 raise RuntimeError("the granted chat listing is truncated")
             self._set_reach(body["data"])
-            # Who this agent is, for the prompt prefix. Only a 200 sets it:
-            # refresh has no timer (connect, group creation, an unknown-chat
-            # frame), so overwriting on a failure would let one blip strip the
-            # offer for the life of a healthy socket.
-            async with http.get(f"{BASE}/v1/agents/cloud/me", headers=self.auth) as resp:
+            # Who this agent is, for the prompt prefix, and its operator-set
+            # persona name (see _agent_name) -- one record serves both, so one
+            # request reads it. Only a 200 sets either: refresh has no timer
+            # (connect, group creation, an unknown-chat frame), so overwriting
+            # on a failure would let one blip strip the offer for the life of
+            # a healthy socket.
+            async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
                 if resp.status == 200:
                     me = await resp.json(content_type=None)
                     self._identity = {"signup": me.get("signup"),
                                       "number": (me.get("line") or {}).get("provider_key")}
+                    # `_one_line`-guarded like every other person-supplied name
+                    # that reaches system authority: unlike the ops-seeded
+                    # `line.display_name` fallback, this one is owner-set
+                    # (PATCH /v1/agents/{uid}), so a newline or an
+                    # instruction-shaped value must not ride straight into the
+                    # who-sentence _with_identity builds.
+                    name = _one_line((me.get("agent") or {}).get("name"))
+                    if name:
+                        self._agent_display_name = name
                 elif resp.status != 404:
                     # 404 is the documented "this token is not one agent" -- a
                     # wildcard or multi-line grant -- and keeps what we hold.
@@ -1301,30 +1312,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # silently running without the offer.
                     _auth_raise_for_status(resp)
                     raise RuntimeError(f"the identity read returned HTTP {resp.status}")
-            # The operator-chosen persona name, for _agent_name -- see its
-            # docstring. Cosmetic, unlike the identity read above: nothing
-            # downstream needs it to proceed, so a blip is logged and keeps
-            # whatever name is already held rather than failing the whole
-            # reach refresh over it -- the same lesson #95 applied to the
-            # settings read on this same endpoint, after the old
-            # raise-on-unexpected-status shape took a turn down over a
-            # cosmetic preference. `.get`-guarded at each step, same reason:
-            # this walks JSON straight off the network.
-            try:
-                async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
-                    if resp.status == 200:
-                        agent = await resp.json(content_type=None)
-                    elif resp.status == 404:
-                        agent = {}            # documented "this token is not one agent"
-                    else:
-                        raise RuntimeError(f"HTTP {resp.status}")
-            except Exception as exc:          # noqa: BLE001 - cosmetic; must not fail the refresh
-                log.warning("[plow_chat] agent name read failed: %s: %s", type(exc).__name__, exc)
-                agent = {}
-            name = agent.get("agent") if isinstance(agent, dict) else None
-            name = name.get("name") if isinstance(name, dict) else None
-            if name:
-                self._agent_display_name = name
         except _PlowAuthError:
             raise                              # terminal; _listen owns the stop
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
