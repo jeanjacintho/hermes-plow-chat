@@ -1309,10 +1309,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # `line.display_name` fallback, this one is owner-set
                     # (PATCH /v1/agents/{uid}), so a newline or an
                     # instruction-shaped value must not ride straight into the
-                    # who-sentence _with_identity builds.
-                    name = _one_line((me.get("agent") or {}).get("name"))
-                    if name:
-                        self._agent_display_name = name
+                    # who-sentence _with_identity builds. Unconditional, not
+                    # `if name:` -- a 200 is the answer for THIS read, so a
+                    # cleared name must clear the cache too, same as a 200
+                    # replaces `_identity` above rather than only patching it.
+                    self._agent_display_name = _one_line((me.get("agent") or {}).get("name")) or None
                 elif resp.status != 404:
                     # 404 is the documented "this token is not one agent" -- a
                     # wildcard or multi-line grant -- and keeps what we hold.
