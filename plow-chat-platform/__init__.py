@@ -3195,14 +3195,11 @@ def _plow_start_group_message(args, **_kwargs):
 
 _GOOGLE_CLIS = frozenset({"plow-gog", "gog"})
 _GMAIL_GROUPS = frozenset({"gmail", "mail", "email"})
-_CALENDAR_GROUPS = frozenset({"calendar", "cal"})
 # gog v0.36.0 "Write" verbs that transmit mail. `import` and `autoreply` do
 # not, and `drafts create|reply|forward` only save a draft.
 _MAIL_SEND_VERBS = frozenset({"send", "reply", "reply-all", "replyall", "forward", "fwd"})
 _DRAFT_GROUPS = frozenset({"drafts", "draft"})
 _DRAFT_SEND_VERBS = frozenset({"send", "post"})
-# latch honours --confirm-conflict on create only; on update it is inert.
-_CALENDAR_CREATE_VERBS = frozenset({"create", "add", "new"})
 
 
 def _argv_flag(argv, name):
@@ -3217,32 +3214,28 @@ def _argv_flag(argv, name):
 
 
 def _google_send_summary(argv):
-    """What `argv` would send, as the owner reads it in the approval prompt —
-    or None when it sends nothing. latch requires the command path first
-    (`plow-gog gmail send …`), so group and verb are positional."""
+    """What `argv` would mail out, as the owner reads it in the approval
+    prompt — or None when it sends no mail. `argv` has latch-owned global
+    flags removed, so group and verb are positional.
+    Calendar is not here: booking over a conflict is the agent's judgment to
+    make (it can be undone by deleting the event), and the hook cannot read
+    the chat the owner already fixed the time in."""
     if len(argv) < 3 or argv[0] not in _GOOGLE_CLIS:
         return None
     group, verb = argv[1], argv[2]
-    if group in _GMAIL_GROUPS:
-        if verb in _MAIL_SEND_VERBS:
-            lines = [f"Send email ({verb})"]
-            if verb != "send" and len(argv) > 3 and not argv[3].startswith("-"):
-                lines.append(f"on message {argv[3]}")
-            for flag in ("to", "cc", "bcc", "subject"):
-                value = _argv_flag(argv, flag)
-                if value:
-                    lines.append(f"{flag}: {value}")
-            body = _argv_flag(argv, "body")
-            if body:
-                lines += ["", body]
-            return "\n".join(lines)
+    if group not in _GMAIL_GROUPS or verb not in _MAIL_SEND_VERBS:
         return None
-    if group in _CALENDAR_GROUPS and verb in _CALENDAR_CREATE_VERBS and "--confirm-conflict" in argv:
-        return (
-            f"Book over a conflict: {_argv_flag(argv, 'summary') or '(untitled)'} "
-            f"{_argv_flag(argv, 'from')} to {_argv_flag(argv, 'to')}"
-        )
-    return None
+    lines = [f"Send email ({verb})"]
+    if verb != "send" and len(argv) > 3 and not argv[3].startswith("-"):
+        lines.append(f"on message {argv[3]}")
+    for flag in ("to", "cc", "bcc", "subject"):
+        value = _argv_flag(argv, flag)
+        if value:
+            lines.append(f"{flag}: {value}")
+    body = _argv_flag(argv, "body")
+    if body:
+        lines += ["", body]
+    return "\n".join(lines)
 
 
 def _is_draft_send(argv):
@@ -3257,39 +3250,70 @@ def _is_draft_send(argv):
 
 
 def _pre_tool_call(tool_name, args, **_kwargs):
-    """Escalate an outbound send to the owner, whatever the latch MCP server
-    is named. Hermes's `approve` directive is a gate the model cannot flip
-    itself: the gateway posts the request into this chat and waits for the
-    owner's /approve. latch's conflict check and plow_start_group_message's
-    dry_run/confirm are re-sendable by the model, so this hook is what makes
-    their override a human decision. Returns None for every call that sends
-    nothing."""
+    """Hold an outbound email for the owner, and hold a conflict override to
+    the owner's own chat, whatever the latch MCP server is named.
+
+    Hermes's `approve` directive is a gate the model cannot flip itself: the
+    gateway posts the request into this chat and waits for the owner's
+    /approve. Mail earns that gate because a sent message cannot be recalled.
+    A conflict override does not: the owner fixed the time in a chat this hook
+    cannot read, so asking again puts the question to somebody who has already
+    answered it. What it still earns is the room check -- a member of a group
+    cannot have fixed the owner's time, so an override from their turn is
+    refused outright. Returns None for every other call."""
     if not str(tool_name).endswith("plow_run_command"):
         return None
     argv = (args or {}).get("argv") if isinstance(args, dict) else None
     if not isinstance(argv, list):
         return None
     argv = [str(arg) for arg in argv]
+    # Mirror latch's accountAt/planPlowGog stripping for classification only.
+    # Keep the original argv for the approval key and execution.
+    classified = argv[:1]
+    confirm_conflict = False
+    tokens = iter(argv[1:])
+    for arg in tokens:
+        if arg in ("--account", "-a"):
+            next(tokens, None)
+        elif arg.startswith(("--account=", "-a")):
+            continue
+        elif arg == "--confirm-conflict":
+            confirm_conflict = True
+        else:
+            classified.append(arg)
     # Mirror latch's own isHelpInvocation: help is a trailing --help/-h with
     # no -- terminator anywhere; it mints no token and reaches nothing.
-    if argv and argv[-1] in ("--help", "-h") and "--" not in argv:
+    if classified and classified[-1] in ("--help", "-h") and "--" not in classified:
         return None
-    if _is_draft_send(argv):
+    if _is_draft_send(classified):
         return {"action": "block",
                 "message": "a draft sent by id shows the owner nothing; send it as one "
                            "gmail send command with recipients, subject and body"}
-    summary = _google_send_summary(argv)
-    if summary is None:
+    summary = _google_send_summary(classified)
+    # The marker, not the command shape. gog takes --account (and every other
+    # global flag) before the group as well as after, so a classifier that
+    # expects `calendar` at argv[1] answers no to a real override and waves it
+    # past the room check below. Which commands the flag applies to is latch's
+    # to decide; over-matching here costs an override outside the owner's DM
+    # the room check it should have had anyway.
+    override = (summary is None and bool(argv) and argv[0] in _GOOGLE_CLIS
+                and confirm_conflict)
+    if summary is None and not override:
         return None
     turn = _ACTIVE_TURN.get() or {}
     if not (turn.get("owner") and turn.get("dm")):
         # The prompt must land where only the owner can read and answer it;
         # a group room would publish the email and let any member approve it.
+        # The same room test refuses an override, for a different reason: the
+        # only person whose fixed time licenses one is not the one speaking.
         return {"action": "block",
                 "message": "email sends and conflict overrides are approved "
                            "only in the owner's own chat; nothing was sent — "
                            "ask the owner to repeat the request in their "
                            "direct chat with you"}
+    if override:
+        # Past the room test, the judgment is the agent's; see the docstring.
+        return None
     # Keyed on the exact argv: "/approve always" may only ever cover a
     # byte-identical re-send, never the next email.
     digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()

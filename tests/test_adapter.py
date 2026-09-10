@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -3181,17 +3182,7 @@ _SEND_ARGV = [
     (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], ("18c9",)),
     (["gog", "email", "reply-all", "18c9", "--body=ok"], ("reply-all",)),
     (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], ("c@d.co",)),
-    ([
-        "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
-        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
-        "--confirm-conflict", "--account", "so@plow.co",
-    ], ("Dentist",)),
     (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], ("a@b.co",)),
-    ([
-        "plow-gog", "calendar", "add", "primary", "--summary", "Standup",
-        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
-        "--confirm-conflict",
-    ], ("Standup",)),
     (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "s", "--", "--help"], ("a@b.co",)),
 ])
 def test_send_summary_names_what_goes_out(
@@ -3212,12 +3203,19 @@ def test_send_summary_names_what_goes_out(
      "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00"],
     ["plow-gog", "calendar", "update", "primary", "evt1", "--confirm-conflict"],
     ["plow-gog", "calendar", "events", "primary"],
+    ["plow-gog", "cal", "create", "primary", "--summary", "Dentist",
+     "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
+     "--confirm-conflict", "--account", "so@plow.co"],
+    ["plow-gog", "calendar", "add", "primary", "--summary", "Standup",
+     "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
+     "--confirm-conflict"],
+    ["plow-gog", "cal", "new", "primary", "--summary", "Standup", "--confirm-conflict"],
     ["plow-gog", "gmail", "import", "/Users/me/Plow/x.eml"],
     ["python3", "-c", "print('gmail send')"],
     ["plow-gog"],
     [],
 ])
-def test_send_summary_ignores_reads_drafts_and_unforced_bookings(
+def test_send_summary_ignores_reads_drafts_and_every_booking(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
@@ -3227,6 +3225,7 @@ def test_send_summary_ignores_reads_drafts_and_unforced_bookings(
 @pytest.mark.parametrize("argv", [
     ["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"],
     ["plow-gog", "gmail", "draft", "post", "r-123"],
+    ["plow-gog", "--account", "so@plow.co", "gmail", "drafts", "send", "r-123"],
 ])
 @pytest.mark.parametrize("turn", [{"chat_uid": "cht_a", "owner": True, "dm": True}, None])
 def test_draft_by_id_send_is_blocked_everywhere(
@@ -3249,6 +3248,48 @@ def test_owner_send_escalates_to_the_human_gate(
     assert out["action"] == "approve"
     assert "andrew@example.com" in out["message"]
     assert out["rule_key"].startswith("google-send:")
+
+
+@pytest.mark.parametrize("flags", [
+    ["--account", "so@plow.co"], ["-a", "so@plow.co"],
+    ["--account=so@plow.co"], ["-a=so@plow.co"], ["-aso@plow.co"],
+    ["--confirm-conflict"],
+    ["--confirm-conflict", "-a", "so@plow.co"],
+])
+def test_leading_global_flags_reach_mail_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, flags: list[str],
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    argv = ["plow-gog", *flags, *_SEND_ARGV[1:-2]]
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert out["action"] == "approve"
+    assert all(value in out["message"] for value in (
+        "andrew@example.com", "Catching up", "Menlo Park or a video call?",
+    ))
+    digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
+    assert out["rule_key"] == f"google-send:{digest}"
+    plain = module._pre_tool_call(
+        "mcp__latch__plow_run_command", {"argv": ["plow-gog", *_SEND_ARGV[1:-2]]},
+    )
+    assert out["rule_key"] != plain["rule_key"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["plow-gog", "--account", "gmail", "--account", "a@example.com",
+     "gmail", "send", "--to", "b@example.com", "--body", "probe"],
+    ["plow-gog", "--account", "a@example.com", "gmail", "send",
+     "--to", "gmail", "--to", "b@example.com", "--body", "probe"],
+])
+def test_group_word_flag_value_cannot_hide_member_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str],
+) -> None:
+    """Flag values cannot choose the action path; repeated flags are last-wins."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_group", "owner": False, "dm": False})
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert out is not None
+    assert out["action"] == "block"
 
 
 def test_rule_key_is_per_message_so_always_never_generalises(
@@ -3276,9 +3317,51 @@ def test_send_outside_the_owner_dm_is_blocked_not_escalated(
     turn at all."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
+    argv = ["plow-gog", "--account", "so@plow.co", *_SEND_ARGV[1:-2]]
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
     assert out["action"] == "block"
     assert "nothing was sent" in out["message"]
+
+
+_FORCED_BOOKING_ARGV = [
+    "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
+    "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
+    "--confirm-conflict", "--account", "so@plow.co",
+]
+
+
+# gog takes its global flags before the group as well as after, and latch
+# strips them wherever they sit. A classifier keyed on the command's shape
+# answers no to this one and waves it past the room check.
+_FORCED_BOOKING_LEADING_ACCOUNT_ARGV = [
+    "plow-gog", "--account", "so@plow.co", "calendar", "create", "primary",
+    "--summary", "Dentist", "--from", "2026-09-09T10:00:00-07:00",
+    "--to", "2026-09-09T11:00:00-07:00", "--confirm-conflict",
+]
+
+
+@pytest.mark.parametrize("argv", [_FORCED_BOOKING_ARGV,
+                                  _FORCED_BOOKING_LEADING_ACCOUNT_ARGV])
+@pytest.mark.parametrize(("turn", "expected"), [
+    ({"chat_uid": "cht_a", "owner": True, "dm": True}, None),
+    ({"chat_uid": "cht_g", "owner": True, "dm": False}, "block"),
+    ({"chat_uid": "cht_b", "owner": False}, "block"),
+    (None, "block"),
+])
+def test_conflict_override_requires_owner_dm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    argv: list[str], turn: Any, expected: str | None,
+) -> None:
+    """In the owner's own chat the hook stands aside: they fixed the time in a
+    chat it cannot read, so asking again puts the question to somebody who has
+    already answered it. Everywhere else the override is refused -- a member of
+    a group cannot have fixed the owner's time, and a cron run with no turn at
+    all has no owner behind it either."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set(turn)
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert (None if out is None else out["action"]) == expected
+
 
 
 @pytest.mark.parametrize("tool_name,args", [
@@ -3288,6 +3371,7 @@ def test_send_outside_the_owner_dm_is_blocked_not_escalated(
     ("mcp__latch__plow_run_command", {}),
     ("mcp__latch__plow_run_command", None),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "--help"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "--help", "--account", "a@x"]}),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "-h"]}),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "drafts", "send", "--help"]}),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "draft", "post", "-h"]}),
