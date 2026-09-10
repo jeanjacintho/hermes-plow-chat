@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import stat
+import time
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,13 @@ from gateway.session import build_session_key
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 LATCH_URL = "https://plow.co/latch"
+# How long a QUIET answer from /v1/agents/me serves the gate below. Only the
+# quiet answer is cached: withholding while the owner has already turned
+# verbose on costs a re-ask, and delivering while they have already turned it
+# off costs the disclosure this gate exists to stop, so staleness is only ever
+# spent in the safe direction. A minute bounds how long an owner who just
+# enabled it waits; an owner who just disabled it waits not at all.
+SETTINGS_TTL_SECONDS = 60
 DASHBOARD_URL = "https://app.plow.co/dashboard"
 # Hermes' own diagnostics reach the adapter through plain send() carrying no
 # metadata that tells them apart from the model's prose, so they are still
@@ -1124,6 +1132,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         }
         self._ws_task = None
         self._anchor_lock = asyncio.Lock()
+        self._quiet_until = 0.0              # while now is under this, the gate is quiet without a read
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
         self._inbound = {}                   # chat uid -> (queue, the task serving it)
@@ -1972,18 +1981,72 @@ class PlowChatAdapter(BasePlatformAdapter):
         return result
 
     async def _verbose_enabled(self, http):
-        """Whether this assistant's owner asked for diagnostic output in chat.
+        """Whether this agent's owner asked for diagnostic output in chat.
 
-        One preference gates all of it -- status frames, background-review
-        posts, turn-stop warnings. Anything but an explicit true reads as
-        quiet, which is also what an API that predates the field serves.
+        One setting gates all of it -- status frames, background-review posts,
+        turn-stop warnings, and the model's mid-turn prose in a shared room.
+        Anything but an explicit true reads as quiet, which is also what an
+        unreadable or field-less API serves.
+
+        Only the quiet answer is cached. A cached true would keep authorizing
+        delivery into a room with a third party in it for up to a minute after
+        the owner switched it off -- and what it would deliver there is the
+        cart, the shipping address and the card this gate exists to withhold.
+        So every delivery-authorizing true is read fresh, and staleness is
+        only ever spent on withholding.
+
+        `GET /v1/agents/me` -- not the `/v1/agents/cloud/me` alias, which
+        serves the old shape and carries no `agent` key at all. Each setting
+        is a property schema plus its `value`, so the walk ends on `value`,
+        never on the entry. It walks JSON straight off the network, where a
+        proxy error page or a shape change can put anything at any level, so
+        each step is guarded: a gate that must not raise cannot afford a bare
+        `.get` on whatever arrived.
         """
-        async with http.get(
-            f"{BASE}/v1/api-keys/current/preferences", headers=self.auth
-        ) as resp:
-            _auth_raise_for_status(resp)
-            prefs = await resp.json(content_type=None)
-        return prefs.get("verbose_output_enabled") is True
+        now = time.monotonic()
+        # Snapshotted, not just compared: what makes an affirmative answer
+        # stale is that a quiet one landed while it was out, and the only
+        # evidence of that is the deadline having MOVED. Asking instead
+        # whether quiet is still unexpired reads a read that took longer than
+        # the TTL as no race at all.
+        quiet_until = self._quiet_until
+        if now < quiet_until:
+            return False
+        found = {}
+        try:
+            async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
+                if resp.status == 200:
+                    found = await resp.json(content_type=None)
+                elif resp.status != 404:
+                    raise RuntimeError(f"HTTP {resp.status}")
+        except Exception as exc:             # noqa: BLE001 - a gate must not raise
+            # Including a 401: this read gates cosmetic output, and the
+            # credential seam belongs to the socket, which is already
+            # presenting the same token and owns the stop. Logged once per
+            # read, and a failed read is quiet for the TTL, so a sustained
+            # outage costs one line a minute rather than one per gated send.
+            # The message carries the status or the transport error and never
+            # the token -- the credential rides a header, never the URL.
+            log.warning("[plow_chat] settings read failed: %s: %s", type(exc).__name__, exc)
+        for key in ("agent", "settings", "verbose_output", "value"):
+            found = found.get(key) if isinstance(found, dict) else None
+        if found is True:
+            # Quiet wins a race. Two gated sends can be on the wire at once,
+            # and both can pass the check above; if a quiet answer landed
+            # while this read was still out, it is the newer answer, and
+            # returning this true would deliver into a shared room after the
+            # owner had already switched verbose off -- the one failure the
+            # whole no-caching-a-true rule exists to prevent.
+            #
+            # Any move of the deadline is that landing, whether or not it has
+            # since expired: a slow read is exactly the case where it has, and
+            # a slow read is the one most likely to have been overtaken.
+            return self._quiet_until == quiet_until
+        # Timestamped on completion, not from `now`: the read is the slow
+        # part, and dating the deadline from before it would retire a quiet
+        # answer early by however long it took.
+        self._quiet_until = time.monotonic() + SETTINGS_TTL_SECONDS
+        return False
 
     async def _invite_api(self, method, path, *, body=None):
         async with aiohttp.ClientSession() as http:
@@ -2111,9 +2174,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         thread as real iMessages (#30). Dropped by default -- the typing
         indicator already runs for the whole turn, so "working" is covered --
         and reported as success so the gateway treats the frame as handled.
-        The verbose_output_enabled credential preference (the dashboard's
-        "Verbose agent output" toggle) opts an assistant into receiving them
-        as messages.
+        The verbose_output setting (the dashboard's "Verbose agent output"
+        toggle) opts an assistant into receiving them as messages.
         """
         async with aiohttp.ClientSession() as http:
             if await self._verbose_enabled(http):

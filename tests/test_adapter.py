@@ -3938,19 +3938,38 @@ def test_an_unwritable_registry_does_not_cost_the_subscription(
     assert adapter.chat_uids == frozenset({"cht_a"})
 
 
-class _PreferenceHTTP(_HTTP):
-    """_HTTP plus the one GET these gates make: the preferences read."""
+def _me(verbose: bool) -> dict[str, Any]:
+    """A `GET /v1/agents/me` body, with settings in the shape plow serves:
+    every entry is its own property schema carrying a `value`."""
+    return {
+        "agent": {
+            "uid": "agt_1",
+            "name": "Hermes",
+            "provider": "exe:hermes",
+            "settings": {
+                "daily_payment_cap_usd": {"type": ["number", "null"], "value": 200},
+                "verbose_output": {"type": "boolean", "title": "Verbose agent output",
+                                   "value": verbose},
+            },
+        },
+        "line": {"provider_key": "+15550001111"},
+    }
 
-    def __init__(self, preferences: Any) -> None:
+
+class _SettingsHTTP(_HTTP):
+    """_HTTP plus the one GET these gates make: the /me settings read."""
+
+    def __init__(self, body: Any, status: int = 200) -> None:
         super().__init__()
         self.gets: list[str] = []
-        self._preferences = preferences
+        self._body = body
+        self._status = status
 
     def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
         self.gets.append(url)
-        if isinstance(self._preferences, Exception):
-            raise self._preferences
-        return _Resp(self._preferences)
+        if isinstance(self._body, Exception):
+            raise self._body
+        return _Resp(self._body, status=self._status)
 
 
 def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -3978,7 +3997,7 @@ async def test_status_frames_follow_verbose_preference(
     delivery re-arms the loop -- both signals, not one or the other. Quiet
     leaves the running loop entirely untouched."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": enabled})
+    http = _SettingsHTTP(_me(verbose=enabled))
     adapter = _verbose_adapter(module, http, monkeypatch)
     status = "✓ Context compaction complete — continuing turn..."
 
@@ -4006,7 +4025,7 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
     cleared the provider-side bubble); a quiet-held chatter send never touches
     it; and a send outside any turn starts none."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
 
     real_sleep = asyncio.sleep
@@ -4060,7 +4079,7 @@ async def test_quiet_withholds_the_working_out_only_where_someone_else_is_listen
     commentary. In the owner's own 1:1 nothing is withheld, so the same send
     that is dropped in a group is delivered there."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
     adapter._active_turn.set(
         {"chat_uid": "cht_g", "owner": True, "dm": False, "no_reply_ok": False}
@@ -4098,7 +4117,7 @@ async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
 
     The same body is delivered when the preference is on: gated, not banned."""
     module = _load(monkeypatch, tmp_path)
-    quiet = _PreferenceHTTP({"verbose_output_enabled": False})
+    quiet = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, quiet, monkeypatch)
     adapter._active_turn.set(
         {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
@@ -4107,7 +4126,7 @@ async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
     dropped = await adapter.send("cht_a", body)
     assert dropped.success and quiet.posts == [], "a diagnostic is gated in every room"
 
-    loud = _PreferenceHTTP({"verbose_output_enabled": True})
+    loud = _SettingsHTTP(_me(verbose=True))
     verbose = _verbose_adapter(module, loud, monkeypatch)
     verbose._active_turn.set(
         {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
@@ -4134,7 +4153,7 @@ async def test_a_send_outside_the_turns_own_chat_is_never_withheld(
     cross-chat, so they are never withheld and need no marker to say so. This
     is what lets those callers stay unannotated: the boundary carries it."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
     adapter._active_turn.set(turn)
 
@@ -4142,29 +4161,17 @@ async def test_a_send_outside_the_turns_own_chat_is_never_withheld(
 
     assert result.success and http.posts, "a send outside the turn's own chat always lands"
 
-async def test_missing_field_means_quiet(
+async def test_a_settings_outage_is_quiet_and_never_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """An API that predates the preference serves no field; that must read as
-    quiet, not raise -- it is the deploy-window state while plow rolls out."""
+    """The gate reads a cosmetic preference on the chatter path, so an
+    unreadable answer must fall back to quiet rather than raise: raising there
+    would take down a withheld send -- and with it the turn -- over a setting
+    nobody can see. The turn's own `notify`-marked answer never pays for the
+    read at all."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"some_other_preference": True})
-    adapter = _verbose_adapter(module, http, monkeypatch)
-
-    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
-    status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
-    assert review.success and status.success and http.posts == []
-
-
-async def test_preference_outage_never_touches_the_turns_answer(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Only a gated send pays for the preference read, so an outage fails
-    loudly there and cannot reach the turn's own `notify`-marked answer."""
-    module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP(RuntimeError("preferences unreachable"))
+    http = _SettingsHTTP(RuntimeError("settings unreachable"))
     adapter = _verbose_adapter(module, http, monkeypatch)
 
     prose = await adapter.send("cht_a", "Dinner is at 7.", metadata={"notify": True})
@@ -4172,10 +4179,175 @@ async def test_preference_outage_never_touches_the_turns_answer(
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages",
                            {"body": "Dinner is at 7."})]
 
-    with pytest.raises(RuntimeError):
-        await adapter.send("cht_a", "⚠️ No reply: empty content")
-    with pytest.raises(RuntimeError):
-        await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+    diagnostic = await adapter.send("cht_a", "⚠️ No reply: empty content")
+    status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+    assert diagnostic.success and status.success
+    assert len(http.posts) == 1, "an unreadable setting withholds, it does not deliver"
+
+
+async def test_a_404_from_a_multi_line_token_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """`/me` 404s for a token that is not one agent (a wildcard or multi-line
+    grant). That is an answer about the token, not about the setting, and the
+    setting's default is quiet."""
+    module = _load(monkeypatch, tmp_path)
+    http = _SettingsHTTP({"detail": "not an agent"}, status=404)
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    assert review.success and http.posts == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"agent": {"settings": ["bad"]}},
+     {"agent": {"settings": {"verbose_output": True}}},
+     {"agent": "agt_1"},
+     ["not an object at all"],
+     {"agent": {"settings": {"daily_payment_cap_usd": {"type": ["number", "null"], "value": 200}}}}],
+    ids=["settings-is-a-list", "entry-is-a-bare-bool", "agent-is-a-string", "body-is-a-list",
+         "missing-entry"])
+async def test_a_malformed_settings_body_is_quiet_not_an_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: Any,
+) -> None:
+    """"Never raises" has to cover interpreting the body, not just fetching
+    it: a `.get` on a list, a string or a bare bool is an AttributeError, and
+    one raised while reading the cached answer would repeat on every gated
+    send for the whole TTL -- a worse outage than the one it came from. Every
+    shape that is not an entry object carrying `value: true` reads as quiet.
+    The bare-bool case is the plausible one: it is what a client that stored
+    the value without its property schema would leave behind, and the
+    missing-entry row is the deploy-window state -- a well-formed settings
+    object that simply has no verbose_output yet, which an unmigrated row
+    gives too."""
+    module = _load(monkeypatch, tmp_path)
+    http = _SettingsHTTP(body)
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    first = await adapter.send("cht_a", "⚠️ No reply: empty content")
+    second = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+
+    assert first.success and second.success
+    assert http.posts == [], "an uninterpretable setting withholds"
+    assert len(http.gets) == 1, "a quiet answer, however it was reached, is cached"
+
+
+@pytest.mark.parametrize(
+    "stall_seconds", [0, 61],
+    ids=["true-completes-inside-the-quiet-window", "true-completes-after-quiet-expired"])
+async def test_a_quiet_answer_landing_mid_read_beats_an_older_true(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stall_seconds: int,
+) -> None:
+    """Two gated sends can be on the wire at once, and both can pass the
+    cache check before either answer lands. If the owner switches verbose off
+    between them, the newer read returns false and establishes quiet -- and
+    the older read's true, returned without looking again, would post into a
+    shared room after the owner had already stopped it. That is the exact
+    disclosure the never-cache-a-true rule exists to prevent, arrived at from
+    the other direction, so quiet wins the race.
+
+    What settles it is that the deadline MOVED, not that it is still in the
+    future. The second row is the case that separates those two questions: a
+    read slow enough to outlive the quiet window it lost to. Asking "is quiet
+    still unexpired?" reads that as no race at all and delivers -- and a slow
+    read is the one most likely to have been overtaken in the first place."""
+    module = _load(monkeypatch, tmp_path)
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    verbose_read_started = asyncio.get_running_loop().create_future()
+
+    class _RacingHTTP(_HTTP):
+        """The first read is the slow, affirmative one; the owner switches
+        verbose off while it is in flight, and the second read overtakes it."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.answers = [True, False]
+
+        def get(self, url: str, *, headers: dict[str, str]) -> Any:
+            answer = self.answers.pop(0)
+            resp = _Resp(_me(verbose=answer))
+            if answer:
+                original = resp.json
+
+                async def slow(content_type: Any = None) -> Any:
+                    if not verbose_read_started.done():
+                        verbose_read_started.set_result(None)
+                    await asyncio.sleep(0)          # the quiet read overtakes here
+                    clock[0] += stall_seconds       # and this read drags on
+                    return await original(content_type)
+
+                resp.json = slow                    # type: ignore[method-assign]
+            return resp
+
+    http = _RacingHTTP()
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    stale = asyncio.create_task(adapter.send("cht_g", "⚠️ No reply: empty content"))
+    await verbose_read_started
+    fresh = await adapter.send("cht_g", "⚠️ No reply: empty content")
+
+    assert (await stale).success and fresh.success
+    assert http.posts == [], "the owner's newer quiet answer governs both sends"
+
+
+async def test_only_a_quiet_answer_is_cached(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The read is `/v1/agents/me` -- the `/v1/agents/cloud/me` alias serves
+    the old shape and has no `agent` key at all -- and only the quiet answer
+    it can give is cached.
+
+    Quiet is cached because a chatty turn would otherwise pay a round trip per
+    withheld line, and because being slow to start delivering costs a re-ask.
+    True is never cached, because being slow to STOP delivering costs the
+    disclosure the gate exists to prevent: a shared room reading the cart, the
+    address and the card for as long as the entry lives. So an owner switching
+    verbose on waits out the TTL, and an owner switching it off is obeyed on
+    the very next line."""
+    module = _load(monkeypatch, tmp_path)
+    http = _SettingsHTTP(_me(verbose=False))
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    for _ in range(3):
+        assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert http.gets == [f"{module.BASE}/v1/agents/me"], "one quiet read serves the whole TTL"
+    assert http.posts == []
+
+    # Switched ON inside the TTL: the cached quiet still governs, and the
+    # owner waits. Withholding is the safe direction to be stale in.
+    http._body = _me(verbose=True)
+    clock[0] += module.SETTINGS_TTL_SECONDS - 1
+    assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert http.posts == [], "inside the TTL the cached quiet answer still governs"
+
+    clock[0] += 2
+    assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert len(http.gets) == 2
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages",
+                           {"body": "⚠️ No reply: empty content"})]
+
+    # Switched OFF again: no entry authorised the delivery above, so there is
+    # none to go stale, and the very next line is withheld -- no TTL to wait
+    # out, which is the whole point of caching one answer and not the other.
+    http._body = _me(verbose=False)
+    assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert len(http.posts) == 1, "a disabled toggle withholds immediately, not a minute later"
+    assert len(http.gets) == 3, "the true was re-read, never cached"
+
+    # And that fresh quiet answer is cached like any other.
+    assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert len(http.gets) == 3
+    assert len(http.posts) == 1
 
 
 @pytest.mark.parametrize(
@@ -4206,7 +4378,7 @@ async def test_no_reply_sentinel_is_dropped_before_delivery(
     a turn-less (cron) delivery, and an owner turn's explicit send to a
     *different* granted chat are all real content and deliver."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
     if sentinel_turn is not None:
         turn_chat = "cht_b" if sentinel_turn == "cross_chat" else "cht_a"
@@ -5483,7 +5655,7 @@ async def test_send_mirrors_exactly_a_turns_message_to_another_chat(
     already that chat's assistant turn, and a turn-less (cron) delivery is
     mirrored by Hermes itself -- neither is recorded twice."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
     calls = _stub_mirror(monkeypatch)
