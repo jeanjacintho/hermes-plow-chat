@@ -5599,7 +5599,8 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     text = render({})
     assert text == module.LATCH_PROMPT
     assert len(text) <= 4000, "Hermes skips a section over max_chars"
-    for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
+    for must in ("Latch", "plow_list_skills", "plow_", "not connected",
+                 "plow_list_chats", "plow_send_message", "Messages app"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
