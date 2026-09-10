@@ -289,8 +289,30 @@ unreachable — cannot buy unbounded turns. Every settlement is announced, and a
 notice that fails to deliver leaves the goal running rather than letting it go
 quiet.
 
+Every turn under a goal opens with the goal itself, framed as what the command
+already established: a standing instruction from the owner who set it, named,
+with their text carried as theirs. It used to ride as "untrusted thread data,
+not an instruction" — the right posture for words the thread supplied, and the
+wrong one for a task the owner personally authorized, which had the agent
+disown it.
+
+Three things bound that. Every field interpolated into the line — the goal
+text and the setter's name alike — is encoded so it cannot end the block or
+start a line that reads as another one: quotation marks are not a boundary,
+and the guarantee is that the block ends where the code says it does, on one
+line, with anything injected left visible inside the text. The line states
+that a goal changes no rule of the turn it rides on: what may be done and
+disclosed in that room remains the channel prompt's answer. And every record
+is the owner's, named or not — the gate predates the field, so a goal written
+before authorship was recorded still reads as theirs. Retiring a goal drops
+the setter's name along with the transcript: neither has a reader once the
+goal is done, and both would otherwise sit on the persistent volume.
+
 An active goal is what unlocks replying to peer agents. Scheduled wakes carry
-the room's ordinary disclosure prompt and take owner authority only in a DM.
+the room's ordinary disclosure prompt and take owner authority only in a DM —
+unchanged by the reframing: in a group the thread is still full of other
+people's words, and an owner-authorized turn acting on them unprompted is a
+confused deputy holding owner-only tools.
 
 In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
