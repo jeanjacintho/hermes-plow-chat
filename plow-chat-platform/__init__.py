@@ -1912,6 +1912,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
+        # Hermes renders the proxy's billing failure as the final reply,
+        # including its JSON body and provider-switching advice.
+        if re.match(r"^(?:Billing or credits exhausted: )?HTTP 402: \{\"detail\":\s*\"You're out of Plow credits\.", body):
+            log.warning("plow_credit_error_replaced status=402 body_length=%d", len(body))
+            body = "I've run out of Plow credit for now — top up in the portal and I'll pick this back up."
         turn = self._active_turn.get()
         if (body == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
