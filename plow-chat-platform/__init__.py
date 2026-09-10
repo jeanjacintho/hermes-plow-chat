@@ -2061,15 +2061,25 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._quiet_until = time.monotonic() + SETTINGS_TTL_SECONDS
         return False
 
-    async def _invite_api(self, method, path, *, body=None):
+    async def _tool_json(self, method, path, *, body=None):
+        """One Plow call a tool handler makes, decoded.
+
+        The non-2xx convention is theirs: `_PlowSendError` carries the status
+        through, so a handler can tell "Plow said no" from "the call fell
+        over". Not `_auth_raise_for_status`, which raises aiohttp's own past
+        401 -- that reaches a handler as an unconfirmed outcome worth
+        retrying, which a refusal is not.
+        """
         async with aiohttp.ClientSession() as http:
             request = getattr(http, method.lower())
             kwargs = {"headers": self.auth}
             if body is not None:
                 kwargs["json"] = body
             async with request(f"{BASE}{path}", **kwargs) as resp:
-                _auth_raise_for_status(resp)
-                return await resp.json(content_type=None)
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                return json.loads(text or "{}")
 
     async def offer_invite(self, turn):
         """Run the one participant-aware invite workflow for a delight turn."""
@@ -2077,15 +2087,25 @@ class PlowChatAdapter(BasePlatformAdapter):
         if any(not turn.get(field) for field in required):
             raise RuntimeError("the active turn has no server participant identity")
 
-        opportunity = await self._invite_api(
-            "POST",
-            "/v1/auth/agent-invites/opportunities",
-            body={
-                "chat_id": turn["chat_uid"],
-                "participant_id": turn["participant_uid"],
-                "message_id": turn["source_message_id"],
-            },
-        )
+        try:
+            opportunity = await self._tool_json(
+                "POST",
+                "/v1/auth/agent-invites/opportunities",
+                body={
+                    "chat_id": turn["chat_uid"],
+                    "participant_id": turn["participant_uid"],
+                    "message_id": turn["source_message_id"],
+                },
+            )
+        except _PlowSendError as exc:
+            # A refusal reads the same wherever it lands. Anything else on this
+            # call is preflight: `/send` has not run, and the POST is replay-safe
+            # by source message, so a later turn resumes cleanly.
+            if _is_refusal(exc.status):
+                raise
+            raise _PlowPreflightError(str(exc.status)) from exc
+        except Exception as exc:
+            raise _PlowPreflightError(type(exc).__name__) from exc
         status = opportunity.get("status")
         if status == "disabled":
             return {"skipped": "consent_declined"}
@@ -2140,7 +2160,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"question_id": record.id}
 
     async def set_invite_consent(self, enabled):
-        data = await self._invite_api(
+        data = await self._tool_json(
             "PUT", "/v1/auth/agent-invites", body={"enabled": enabled}
         )
         if data.get("enabled") is not enabled:
@@ -2155,7 +2175,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         opportunity_id = context.get("opportunity_id")
         if not opportunity_id:
             raise RuntimeError("agent invite opportunity is missing")
-        result = await self._invite_api("POST", f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send")
+        result = await self._tool_json("POST", f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send")
         status = result.get("status")
         if status != "sent":
             raise RuntimeError("agent invite response has an invalid shape")
@@ -2459,44 +2479,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         """PUT the owner's name/relationship for one handle in their contact book.
 
         No `_send_guard`: no chat to scope to; the owner-turn check is the gate.
-
-        Same non-2xx convention as `start_group_thread`: read the body once,
-        raise `_PlowSendError(status, text)` past 400 so the tool's own
-        `except` reports it, rather than `_auth_raise_for_status`'s
-        `resp.raise_for_status()` -- that raises aiohttp's own exception for
-        anything but 401, which the tool does not catch.
         """
         segment = urllib.parse.quote(handle, safe="")
-        async with aiohttp.ClientSession() as http:
-            async with http.put(f"{BASE}/v1/contacts/{segment}",
-                                json=body, headers=self.auth) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise _PlowSendError(resp.status, text)
-                return json.loads(text or "{}")
+        return await self._tool_json("PUT", f"/v1/contacts/{segment}", body=body)
 
     async def contacts(self):
-        """GET the owner's whole contact book, owner's own row first.
-
-        The read half of `name_contact`, and it shares that method's non-2xx
-        convention for the same reason: the tool catches `_PlowSendError`, not
-        aiohttp's own.
-        """
-        return await self._get_tool_json("/v1/contacts")
-
-    async def _get_tool_json(self, path):
-        """One GET the tool handlers make, decoded.
-
-        The non-2xx convention is theirs: `_PlowSendError` carries the status
-        through, so a handler can tell "Plow said no" from "the read fell
-        over".
-        """
-        async with (aiohttp.ClientSession() as http,
-                    http.get(f"{BASE}{path}", headers=self.auth) as resp):
-            text = await resp.text()
-            if resp.status >= 400:
-                raise _PlowSendError(resp.status, text)
-            return json.loads(text)
+        """GET the owner's whole contact book, owner's own row first."""
+        return await self._tool_json("GET", "/v1/contacts")
 
     async def list_chats(self):
         """Every chat this credential can send to, as a compact listing.
@@ -2527,7 +2516,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         while the old reach still stands rather than half-adopting a listing
         that could not be read.
         """
-        body = await self._get_tool_json("/v1/chats")
+        body = await self._tool_json("GET", "/v1/chats")
         listed = [_chat_summary(chat) for chat in body["data"]
                   if chat["status"] == "active"]
         # The whole payload, exactly as `_refresh_reach` passes it: reach has
@@ -3122,12 +3111,14 @@ class _PlowSendError(Exception):
 
 
 class _PlowPreflightError(Exception):
-    """A failure before the create POST was ever issued.
+    """A failure before any delivery POST was issued.
 
     Distinct from the generic post-POST bucket because it is definitive:
-    nothing was sent, there is no thread to check, and retrying after the
+    nothing was sent, there is nothing to check, and retrying after the
     underlying problem is fixed is safe — the opposite of what the
-    delivery-unknown message tells the model.
+    delivery-unknown message tells the model. Thread creation raises it before
+    its create POST; the invite workflow raises it on the opportunity POST,
+    which runs before `/send` and so cannot have delivered anything.
     """
 
 
@@ -3981,6 +3972,39 @@ async def _handle_invite_consent(question, response):
     return DeferredQuestionResult.done("Got it — I won’t offer Plow invites on your behalf.")
 
 
+def _is_refusal(status):
+    """Plow saying no, as opposed to a send that failed.
+
+    Every 4xx but 424: that one is a delivery status, so it answers "did it
+    arrive", never "may I". Both invite call sites ask this same question, and
+    the bug that named this was them drifting -- only one of them knew about
+    424, so a 424 on the opportunity POST was reported as possibly-delivered by
+    a call that had not sent anything yet.
+    """
+    return status < 500 and status != 424
+
+
+def _invite_retry_safe(exc):
+    """Whether Plow says it left the invite re-sendable.
+
+    `send_opportunity` sets `invite_reopened` only after its recovery has
+    COMMITTED (plow#1869), so the marker's absence already covers both states a
+    retry must not touch: a send that may have reached the invitee, and a
+    recovery that failed with the opportunity still closed. Nothing is inferred
+    from the status or the provider code -- which could not separate those two,
+    since a failed recovery re-raises the original error unchanged.
+
+    An undecodable body, an older API that does not send the marker, and a
+    drifted envelope all read the same way: not re-sendable. That is the safe
+    side, so this does not depend on which side deploys first.
+    """
+    try:
+        details = (json.loads(exc.detail).get("error") or {}).get("details") or {}
+    except (ValueError, AttributeError):
+        return False
+    return details.get("invite_reopened") is True
+
+
 def _plow_offer_invite(args, **_kwargs):
     """Bridge the fixed invite workflow to the live adapter's loop."""
     if args:
@@ -3999,12 +4023,38 @@ def _plow_offer_invite(args, **_kwargs):
     try:
         operation = adapter.offer_invite(turn)
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
-    except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
+    except _PlowPreflightError as exc:
+        return json.dumps({
+            "success": False,
+            "error": f"the invite never started ({exc}); nothing was sent, so calling again on a "
+                     "later turn is safe",
+        })
+    except _PlowSendError as exc:
+        # Three outcomes, and the status settles only the first. A plain 4xx is
+        # Plow refusing: nothing was sent, every retry meets the same refusal,
+        # and naming what was refused is what stops the model improvising a
+        # route around it. Past that the question is whether the invite is
+        # re-sendable, which only the body answers.
+        if _is_refusal(exc.status):
+            return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+        if _invite_retry_safe(exc):
+            return json.dumps({
+                "success": False,
+                "error": f"the invite did not send ({exc.status}); Plow reopened it, so calling "
+                         "again on a later turn re-sends it",
+            })
         return json.dumps({
             "success": False,
             "delivery_unknown": True,
-            "error": f"could not confirm the invite workflow ({type(exc).__name__}); it may or may not "
-                     "have completed; retrying is safe",
+            "error": f"could not confirm the invite ({exc.status}); it may already have reached "
+                     "them, so do NOT call again",
+        })
+    except Exception as exc:  # noqa: BLE001 - an unconfirmed delivery is not a failure to retry
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"could not confirm the invite ({type(exc).__name__}); it may already have "
+                     "reached them, so do NOT call again",
         })
     return json.dumps({"success": True, **result})
 

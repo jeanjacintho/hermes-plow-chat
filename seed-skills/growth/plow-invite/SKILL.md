@@ -58,8 +58,20 @@ The durable opportunity is the only continuation path.
 
 ## If the tool fails
 
-Drop the invite silently: do not mention the failure in either thread and do
-not retry in a loop. A rate cap is spent for the day. `delivery_unknown` means
-the server could not confirm the outcome. The workflow is replay-safe, so you
-may call `plow_offer_invite` again on a later user turn; never loop on it
-within this one.
+Never loop on the tool within this turn, and never substitute the public
+signup phrase or any other route -- the invite is the only path that carries
+the referral, so an invite that failed is not an invitation to improvise one.
+
+Read the receipt; it says which of three happened.
+
+`delivery_unknown` -- the server could not confirm the outcome. The invite may
+already have reached them, so say nothing in either thread and do NOT call
+again: a second call would mint a second live invite for the same person.
+
+`calling again ... is safe` -- the send definitively did not happen, whether it
+never started or Plow reopened it. Say nothing now; you may call
+`plow_offer_invite` again on a later qualifying turn.
+
+`Plow declined (<status>)` -- terminal. Nothing was sent, and calling again
+gets the same answer. Tell them briefly and plainly why, in your own words,
+and leave it there.

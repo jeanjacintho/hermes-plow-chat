@@ -286,6 +286,10 @@ class _ChatResourceHTTP:
         self.calls.append(("get", url, kwargs))
         return self.response
 
+    def post(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("post", url, kwargs))
+        return self.response
+
     def put(self, url: str, **kwargs: Any) -> _Resp:
         self.calls.append(("put", url, kwargs))
         return self.response
@@ -2637,25 +2641,49 @@ def test_invite_owner_notification_refuses_wrong_context(
     assert error.lower() in out["error"].lower()
 
 
+# Plow marks a committed reopen and nothing else (plow#1869), so every other
+# body -- an unconfirmed send, a failed recovery, an older API, a drifted
+# envelope -- is the same "not re-sendable" answer rather than its own case.
+_REOPENED = json.dumps({"error": {"details": {"invite_reopened": True}}})
+_NOT_REOPENED = json.dumps({"error": {"details": {"provider_error_code": "rejected"}}})
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected", "may_call_again"),
+    [
+        pytest.param(None, None, "may already have reached", False, id="non-http-unconfirmed"),
+        pytest.param(503, "{}", "may already have reached", False, id="5xx-unconfirmed"),
+        pytest.param(424, _REOPENED, "calling again", True, id="424-marked-reopened"),
+        pytest.param(424, _NOT_REOPENED, "may already have reached", False, id="424-unmarked-is-not-resendable"),
+        pytest.param(424, "not json", "may already have reached", False, id="424-undecodable-is-not-resendable"),
+        pytest.param(500, _REOPENED, "calling again", True, id="marker-is-read-at-any-status"),
+        pytest.param(403, '{"error":{"message":"agent invites not enabled"}}', "Plow declined (403)", False, id="4xx-declined"),
+    ],
+)
 def test_invite_workflow_reports_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    status: int | None,
+    detail: str | None,
+    expected: str,
+    may_call_again: bool,
 ) -> None:
+    """Unmarked means not re-sendable, so a duplicate invite is unreachable."""
     module = _load(monkeypatch, tmp_path)
-    _live_tool(
-        module,
-        monkeypatch,
-        "offer_invite",
-        raises=RuntimeError("HTTP 503"),
-    )
+    raises = (RuntimeError("HTTP 503") if status is None
+              else module._PlowSendError(status, detail))
+    _live_tool(module, monkeypatch, "offer_invite", raises=raises)
     module._ACTIVE_TURN.set(_invite_turn())
 
     out = json.loads(module._plow_offer_invite({}))
 
+    terminal = expected.startswith("Plow declined")
+
     assert out["success"] is False
-    assert out["delivery_unknown"] is True
-    assert "may or may not" in out["error"]
-    assert "do not retry" not in out["error"].lower()
+    assert expected in out["error"]
+    assert ("calling again" in out["error"]) is may_call_again
+    assert ("do NOT call again" in out["error"]) is not (terminal or may_call_again)
+    assert out.get("delivery_unknown", False) is not (terminal or may_call_again)
 
 
 @pytest.mark.parametrize(
@@ -2840,7 +2868,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
             "praise": "I love Plow. This is amazing.",
         }
 
-    monkeypatch.setattr(adapter, "_invite_api", api)
+    monkeypatch.setattr(adapter, "_tool_json", api)
     turn = _invite_turn()
 
     result = await adapter.offer_invite(turn)
@@ -2907,7 +2935,7 @@ async def test_resolved_consent_sends_once_or_stays_declined(
             return {"status": "sent"}
         return {"status": "disabled"}
 
-    monkeypatch.setattr(adapter, "_invite_api", api)
+    monkeypatch.setattr(adapter, "_tool_json", api)
     result = await adapter.offer_invite(_invite_turn())
 
     assert calls[0] == (
@@ -2922,6 +2950,60 @@ async def test_resolved_consent_sends_once_or_stays_declined(
         assert result == {"skipped": "consent_declined"}
         assert len(calls) == 1
     assert ctx.deferred_questions.enqueued == []
+
+
+async def test_a_declined_invite_send_reaches_the_tool_as_a_decline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Non-2xx follows the contact book's convention -- `_PlowSendError`
+    carrying the status -- so the tool can tell Plow declining from the call
+    falling over. `_auth_raise_for_status` raised aiohttp's own past
+    401, which the tool reads as an unconfirmed delivery it should retry."""
+    from datetime import datetime, timezone
+
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ChatResourceHTTP(_Resp({"detail": "agent invites not enabled"}, status=403))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    with pytest.raises(module._PlowSendError) as err:
+        await adapter.resume_invite({"opportunity_id": "agi_1",
+                                     "triggered_at": datetime.now(timezone.utc).isoformat()})
+
+    assert err.value.status == 403
+    assert "agent invites not enabled" in err.value.detail
+    assert http.calls[0][0] == "post"
+    assert http.calls[0][1] == f"{module.BASE}{INVITE_SEND_CALL[1]}"
+
+
+@pytest.mark.parametrize(
+    ("status", "raises_not_sent"),
+    [
+        pytest.param(503, True, id="5xx-on-create-never-started"),
+        pytest.param(424, True, id="424-on-create-never-started"),
+        pytest.param(404, False, id="4xx-on-create-is-still-a-refusal"),
+    ],
+)
+async def test_a_failed_opportunity_post_is_definitively_not_sent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int, raises_not_sent: bool
+) -> None:
+    """Only `/send` can deliver, so a failure before it is definitively not sent."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    http = _ChatResourceHTTP(_Resp({"detail": "nope"}, status=status))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    expected = module._PlowPreflightError if raises_not_sent else module._PlowSendError
+    with pytest.raises(expected) as err:
+        await adapter.offer_invite(_invite_turn())
+
+    if raises_not_sent:
+        assert str(err.value) == str(status)
+    else:
+        assert err.value.status == status
+    # Whichever it is, the send endpoint was never reached.
+    assert all(INVITE_SEND_CALL[1] not in call[1] for call in http.calls)
 
 
 @pytest.mark.parametrize("hours_old", [23, 25])
@@ -2940,7 +3022,7 @@ async def test_only_fresh_approval_resumes_original_thread(
         api_calls.append((method, path, body))
         return {"status": "sent"}
 
-    monkeypatch.setattr(adapter, "_invite_api", api)
+    monkeypatch.setattr(adapter, "_tool_json", api)
     context = {
         "opportunity_id": "agi_1",
         "participant_identity": "Taylor",
