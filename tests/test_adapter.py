@@ -1383,7 +1383,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
 
 
 # The dashboard cards the prefix names, in the order it names them.
-_CARDS = ("credits and usage", "Plow lines", "trusted group chats", "delight invites",
+_CARDS = ("credits and usage", "Plow lines", "full trust for group chats", "delight invites",
           "the daily payment limit", "verbose output", "the Latch connection")
 
 
@@ -2147,12 +2147,10 @@ def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypa
     """The three canonical group rules ride every external turn: the room-scoped
     disclosure boundary, the no-relay fact, and who owns this agent."""
     module = _load(monkeypatch, tmp_path)
-    p = module.EXTERNAL_CHANNEL_PROMPT.lower()
-    assert "do not reveal" in p           # disclosure
-    assert "already" in p                 # no-relay: they already received it
-    assert "does not own" in p            # speaker-ownership fact
-    for private_kind in ("email contents", "files", "slack", "messages", "contacts", "credentials"):
-        assert private_kind in module._DISCLOSURE.lower()
+    prompt = module._channel_prompt({"type": "group", "trusted": False}, "member", _chat("cht_a", group=True), {})
+    for rule in (module._DISCLOSURE, module._NO_RELAY, module._SPEAKER_FACT):
+        assert rule in prompt
+    assert module._TRUSTED_CONVERSATION not in prompt
 
 
 def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -3130,8 +3128,9 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, confirm: Any
 ) -> None:
     """bool("false") is True, and a model emits that string for a declared bool.
-    This is the only guard on the tool's one irreversible effect."""
+    Explicit confirmation is required even on an authorized owner turn."""
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
@@ -3144,6 +3143,7 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, dry_run: Any
 ) -> None:
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     sent: list[tuple[str, str]] = []
     _live_tool(
         module,
@@ -3421,18 +3421,18 @@ def test_group_message_reports_adoption_separately_from_delivery(
         pytest.param({"chat_uid": "cht_a", "owner": False}, id="member-turn"),
     ],
 )
-def test_only_an_owner_turn_can_start_a_trusted_thread(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None
+@pytest.mark.parametrize("trusted", [False, True])
+def test_only_an_owner_turn_can_start_a_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, trusted: bool
 ) -> None:
-    """Trust hands the new participants the owner's agent — a member of a
-    trusted group must not be able to mint themselves a fresh trusted line."""
+    """Only the owner may send into a new or resumed room, in either mode."""
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=AssertionError("must not send"))
     module._ACTIVE_TURN.set(turn)
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
-         "dry_run": False, "confirm": True, "trusted": True}))
+         "dry_run": False, "confirm": True, "trusted": trusted}))
     assert out["success"] is False
     assert "owner" in out["error"] and "nothing was sent" in out["error"]
 
@@ -3445,6 +3445,7 @@ def test_no_falsy_or_unparseable_trusted_grants_access(
     as False and an unparseable one falls to the same side — the direction
     that grants nothing."""
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
                result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
@@ -3454,21 +3455,19 @@ def test_no_falsy_or_unparseable_trusted_grants_access(
     assert sent == [(["+15550001111"], "hi", False)]
 
 
-def test_the_schema_carries_the_trusted_consent_question(
+def test_start_group_does_not_require_a_trust_question(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """The tool description is where the model learns to ask the owner before
-    granting the new participants access to the assistant."""
     module = _load(monkeypatch, tmp_path)
-    schema = module.PLOW_START_GROUP_MESSAGE_SCHEMA
-    assert schema["parameters"]["properties"]["trusted"]["default"] is False
-    desc = schema["description"]
-    assert "access" in desc
-    assert "plow_set_conversation_trusted" in desc
+    assert "Do you want them to be able to talk to me" not in (
+        module.PLOW_START_GROUP_MESSAGE_SCHEMA["description"]
+    )
+    assert "returned `trusted` value is authoritative: read it and tell the owner if it differs" in module.PLOW_START_GROUP_MESSAGE_SCHEMA["description"]
 
 
 def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     assert module._live is None
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
@@ -3573,6 +3572,7 @@ async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_conn
     `_ensure_anchor` at all and race the still-in-progress newest-vs-empty
     decision."""
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     entered, resumed = asyncio.Event(), asyncio.Event()
 
@@ -3691,6 +3691,7 @@ def test_a_malformed_create_response_surfaces_as_delivery_unknown(
     """The strict-read KeyError reaches the tool's generic handler: the POST
     may have been committed, so the answer is delivery-unknown, not retry."""
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     _live_tool(module, monkeypatch, "start_group_thread", raises=KeyError("uid"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
@@ -3744,6 +3745,7 @@ def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=module._PlowPreflightError("RuntimeError: home chat has no agent line"))
     out = json.loads(module._plow_start_group_message(
@@ -4972,6 +4974,43 @@ async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
     assert prompt.startswith("You are Elm, a Plow assistant")
 
 
+@pytest.mark.parametrize("group", [False, True], ids=["owner-dm", "group"])
+@pytest.mark.parametrize("trusted", [False, True], ids=["discretion", "full-trust"])
+async def test_goal_wake_can_start_a_thread_only_with_owner_dm_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, group: bool, trusted: bool,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "MessageEvent", SimpleNamespace)
+    sent: list[Any] = []
+    adapter = _live_tool(module, monkeypatch, "start_group_thread",
+                         result={"chat_id": "cht_new", "adoption": "adopted"}, record=sent)
+    adapter._set_reach([_chat("cht_a", group=group, trusted=trusted)])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _HTTP())
+    monkeypatch.setattr(adapter, "_goal_after_turn", mock.AsyncMock())
+    args = {"recipients": ["+15550001111"], "body": "Can we meet Friday?",
+            "dry_run": False, "confirm": True, "trusted": False}
+    results = []
+
+    async def process(event: Any) -> None:
+        await adapter.on_processing_start(event)
+        try:
+            # Hermes copies the processing context into its tool worker.
+            results.append(json.loads(await asyncio.to_thread(module._plow_start_group_message, args)))
+        finally:
+            await adapter.on_processing_complete(event, None)
+
+    monkeypatch.setattr(adapter, "handle_message", process)
+    await adapter._goal_fire("cht_a", module._goal_new("Arrange a meeting with Taylor"))
+
+    assert results[0]["success"] is (not group)
+    assert sent == ([] if group else [(["+15550001111"], args["body"], False)])
+    if group:
+        assert "nothing was sent" in results[0]["error"]
+    assert module._ACTIVE_TURN.get() is None
+    # A plain cron call has no processing event and acquires no owner authority.
+    assert json.loads(module._plow_start_group_message(args))["success"] is False
+
+
 async def test_a_wake_fired_under_a_replaced_goal_cannot_settle_its_successor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
@@ -5427,9 +5466,6 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
-    # The Mac carries owner authority, so the routing rule must defer to the
-    # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
-    assert "only your owner directs work on the Mac" in text
     assert "not your owner" in text
 
 
