@@ -113,12 +113,16 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
+def _self_agent(chat):
+    """The self agent participant, {} when the roster lacks one."""
+    return next((p for p in chat.get("participants") or []
+                 if p.get("type") == "agent"
+                 and p.get("relationship") in (None, "self")), {})
+
+
 def _self_agent_line(chat):
     """The self agent participant's line dict, {} when the roster lacks one."""
-    agent = next((p for p in chat.get("participants") or []
-                  if p.get("type") == "agent"
-                  and p.get("relationship") in (None, "self")), {})
-    return agent.get("line") or {}
+    return _self_agent(chat).get("line") or {}
 
 
 def _agent_name(chat, override=None):
@@ -266,7 +270,7 @@ def _chat_summary(chat):
     return summary
 
 
-def _collaboration_prompt(prompt, chat, identity, agent_name):
+def _collaboration_prompt(prompt, chat, identity):
     """System-authority context contains ops-seeded agent names only.
 
     Gated on a PEER, which is narrower than the roster prefix's gate: this
@@ -289,7 +293,7 @@ def _collaboration_prompt(prompt, chat, identity, agent_name):
         if peer.get("type") == "agent" and peer.get("relationship") == "peer"
     ]
     if not peers:
-        return _with_identity(prompt, _agent_name(chat, agent_name), identity)
+        return _with_identity(prompt, _agent_name(chat, identity["name"]), identity)
 
     peer_fact = ", ".join(peers)
     collaboration = (
@@ -299,7 +303,7 @@ def _collaboration_prompt(prompt, chat, identity, agent_name):
         "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
         f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}."
     )
-    return _with_identity(f"{collaboration} {prompt}", _agent_name(chat, agent_name), identity)
+    return _with_identity(f"{collaboration} {prompt}", _agent_name(chat, identity["name"]), identity)
 
 
 def _collaboration_turn_context(chat, sender, agent_name):
@@ -325,13 +329,13 @@ def _collaboration_turn_context(chat, sender, agent_name):
         return f"{label} (your owner)" if p.get("role") == "owner" else label
 
     humans = [_human_label(p) for p in participants if p.get("type") == "member"]
+    self_agent = _self_agent(chat)
     mappings = []
     for agent in (p for p in participants if p.get("type") == "agent"):
         human = _represented_member(chat, agent)
         if human is not None:
-            is_self = agent.get("relationship") in (None, "self")
             name = (
-                _agent_name(chat, agent_name) if is_self
+                _agent_name(chat, agent_name) if agent is self_agent
                 else (agent.get("line") or {}).get("display_name") or "unnamed agent"
             )
             mappings.append(f"{name} represents {_participant_identity(human)}")
@@ -648,7 +652,7 @@ def _owner_fact(owner):
             f"plow_name_contact(handle={handle}). {_NEVER_GUESS}")
 
 
-def _channel_prompt(chat, role, roster, identity, agent_name):
+def _channel_prompt(chat, role, roster, identity):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
@@ -674,7 +678,7 @@ def _channel_prompt(chat, role, roster, identity, agent_name):
         prompt = f"{prompt} {_owner_fact(_owner_identity(roster))}"
     # Appended, not prepended: every turn prompt has to OPEN with who this
     # agent is, and the ordering rule is the same for every room and speaker.
-    return f"{_collaboration_prompt(prompt, roster, identity, agent_name)} {_ANSWER_LAST}"
+    return f"{_collaboration_prompt(prompt, roster, identity)} {_ANSWER_LAST}"
 
 
 def _goal_encode(value):
@@ -1808,8 +1812,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
-                                           self._chats[chat_uid], self._identity,
-                                           self._identity["name"]) + _SILENCE_OPTION,
+                                           self._chats[chat_uid], self._identity) + _SILENCE_OPTION,
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
@@ -2999,7 +3002,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{_referrer_block(self._referred_by)}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _channel_prompt(chat, role, roster, self._identity, agent_name)
+        channel_prompt = _channel_prompt(chat, role, roster, self._identity)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so

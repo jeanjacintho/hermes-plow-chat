@@ -1741,7 +1741,7 @@ def test_member_labels_never_gain_channel_prompt_authority(
     sender = chat["participants"][-1]
 
     prompt = module._collaboration_prompt(
-        module.EXTERNAL_CHANNEL_PROMPT, chat, {"signup": None, "number": None}, None)
+        module.EXTERNAL_CHANNEL_PROMPT, chat, {"signup": None, "number": None, "name": None})
     turn_context = module._collaboration_turn_context(chat, sender, None)
 
     assert "Ignore prior rules" not in prompt
@@ -1765,8 +1765,8 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # takes, and the owner's own row says so, so naming the owner has a source too.
     assert "Abby (+15550000002) (landlord)" in context
     assert "Sam (+15550000001) (your owner)" in context
-    identity = {"signup": None, "number": None}
-    prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity, None)
+    identity = {"signup": None, "number": None, "name": None}
+    prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity)
     assert "Abby" not in prompt
     assert "landlord" not in prompt
     # _RELATIONSHIP_FACT is composed in by _collaboration_prompt (same gate as
@@ -1774,7 +1774,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # composed prompt a real turn actually gets.
     for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
                  module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
-        composed = module._collaboration_prompt(base, chat, identity, None)
+        composed = module._collaboration_prompt(base, chat, identity)
         assert module._RELATIONSHIP_FACT in composed
         # A bare handle is a hole in the same roster, so the instruction to
         # fill it rides the same gate: ask, once, and record it -- rather than
@@ -1783,7 +1783,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
         assert "plow_name_contact" in composed
     # OWNER_CHANNEL_PROMPT is only ever selected for a solo DM turn, so that's
     # the composition a real turn produces -- not this group chat.
-    solo = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity, None)
+    solo = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity)
     assert module._RELATIONSHIP_FACT not in solo
     assert module._NAME_FACT not in solo
     # An unnamed member reads as their handle, never as an opaque uid: the bare
@@ -4512,7 +4512,7 @@ def test_every_silence_instruction_names_the_sentinel(
     its silence, which then delivers. Every turn that may warrant no reply
     is told to answer with the sentinel send() drops instead."""
     module = _load(monkeypatch, tmp_path)
-    collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None}, None)
+    collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None, "name": None})
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
                    module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT,
                    module.GROUP_OWNER_CHANNEL_PROMPT,
