@@ -5474,14 +5474,15 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     text = render({})
     assert text == module.LATCH_PROMPT
     assert len(text) <= 4000, "Hermes skips a section over max_chars"
-    for must in ("Latch", "plow_list_skills", "plow_", "not connected",
-                 # Authority over the owner's accounts is authorship too: what
-                 # leaves their mailbox or their number leaves as them.
-                 "under their name",
-                 "never send a message through their channels as yourself"):
+    for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
+    # Owned by the base persona now (plow-hermes-agent image/seed/SOUL.md
+    # § Your own lines, and your owner's accounts) — a second copy here would
+    # be a second owner to drift.
+    for must_not in ("authorship as well as authority", "as yourself"):
+        assert must_not not in text
 
 
 def _stub_mirror(
