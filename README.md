@@ -21,6 +21,10 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
+> Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
+> and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
+> deploy both API changes before pinning this plugin, or reply context will be absent
+> or indexed media replies will remain unresolved.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
 > `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
@@ -174,6 +178,12 @@ distinct turns. The ack is the burst's last uid, so a restart mid-burst
 backfills the whole burst; a hand-off that fails is retried where it sits, with
 the rest of the chat waiting behind it.
 
+Inline replies carry the quoted sender, time, body, and part label as untrusted
+turn data. If the reply has no attachments of its own, the adapter delivers the
+quoted parent's media through the normal attachment path: the matching provider
+part when its index is available, otherwise all parent attachments. Everything
+comes from the message frame; no parent-message lookup is made.
+
 ### Trusted group conversations
 
 Trust is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
@@ -326,7 +336,7 @@ sets their account name, and a relationship on their own handle is refused. The
 tool is owner-turn-authorized only; it refuses outright during a member's turn
 and outside any active turn at all — a direct call cannot write a label except
 on the owner's own turn. A relationship renders as
-`Name [handle] (relationship)` in the untrusted roster context above — where
+`Name (handle) (relationship)` in the untrusted roster context above — where
 the owner's own row also carries `(your owner)` — never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
