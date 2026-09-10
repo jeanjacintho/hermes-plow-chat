@@ -807,9 +807,7 @@ def _reply_parts(reply):
         if index is not None and item.get("part_index") == index:
             kind = "photo" if (item["content_type"] or "").startswith("image/") else "attachment"
             return [item], f"{kind} {number} of {len(attachments)}"
-    if attachments and (index is None or any(item.get("part_index") is None for item in attachments)):
-        return attachments, "media (unresolved)"
-    return attachments, "text"
+    return attachments, "media (unresolved)" if attachments else None
 
 
 def _quoted_reply_context(reply, chat):
@@ -817,8 +815,10 @@ def _quoted_reply_context(reply, chat):
     parent = reply["message"]
     name = _speaker_name(parent["sender"], chat)[0]
     _parts, label = _reply_parts(reply)
-    context = (f'Replying to {name} at {parent["created_at"]}: "{parent["body"]}" '
-               f'— quoted part: {label}.')
+    context = f'Quoted message from {name} at {parent["created_at"]}: "{parent["body"]}"'
+    if label is not None:
+        context += f" — quoted part: {label}"
+    context += "."
     return json.dumps(context, ensure_ascii=False)
 
 
