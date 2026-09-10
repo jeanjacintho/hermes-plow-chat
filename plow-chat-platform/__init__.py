@@ -127,7 +127,7 @@ def _agent_name(chat, override=None):
     `override`, if a non-empty value, takes priority in every text surface
     this function feeds — the collaboration prompt and (via the mapping loop
     in `_collaboration_turn_context`) the roster line. Callers pass
-    `self._agent_display_name`: `agent.name` from `GET /v1/agents/me`, set by
+    `self._identity["name"]`: `agent.name` from `GET /v1/agents/me`, set by
     the owner with `PATCH /v1/agents/{uid}` and read back at reach refresh, no
     reprovision or dotenv access needed. It does not change `line.display_name`
     itself, and it does not reach the iMessage contact card, which the server
@@ -1151,8 +1151,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._configured_home_chat_uid = os.environ["PLOW_HOME_CHANNEL"]
         self.home_chat_uid = self._configured_home_chat_uid
         self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
-        self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
-        self._agent_display_name = None      # persona name, read at reach refresh, see _agent_name
+        self._identity = {"signup": None, "number": None, "name": None}   # read at reach refresh, see _refresh_reach and _agent_name
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
@@ -1302,18 +1301,17 @@ class PlowChatAdapter(BasePlatformAdapter):
             async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
                 if resp.status == 200:
                     me = await resp.json(content_type=None)
+                    # `name` is `_one_line`-guarded like every other
+                    # person-supplied value that reaches system authority:
+                    # unlike the ops-seeded `line.display_name` fallback, this
+                    # one is owner-set (PATCH /v1/agents/{uid}), so a newline
+                    # or an instruction-shaped value must not ride straight
+                    # into the who-sentence _with_identity builds. The whole
+                    # dict is replaced, not patched -- a 200 is the answer for
+                    # THIS read, so a cleared name must clear the cache too.
                     self._identity = {"signup": me.get("signup"),
-                                      "number": (me.get("line") or {}).get("provider_key")}
-                    # `_one_line`-guarded like every other person-supplied name
-                    # that reaches system authority: unlike the ops-seeded
-                    # `line.display_name` fallback, this one is owner-set
-                    # (PATCH /v1/agents/{uid}), so a newline or an
-                    # instruction-shaped value must not ride straight into the
-                    # who-sentence _with_identity builds. Unconditional, not
-                    # `if name:` -- a 200 is the answer for THIS read, so a
-                    # cleared name must clear the cache too, same as a 200
-                    # replaces `_identity` above rather than only patching it.
-                    self._agent_display_name = _one_line((me.get("agent") or {}).get("name")) or None
+                                      "number": (me.get("line") or {}).get("provider_key"),
+                                      "name": _one_line((me.get("agent") or {}).get("name")) or None}
                 elif resp.status != 404:
                     # 404 is the documented "this token is not one agent" -- a
                     # wildcard or multi-line grant -- and keeps what we hold.
@@ -1811,7 +1809,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
                                            self._chats[chat_uid], self._identity,
-                                           self._agent_display_name) + _SILENCE_OPTION,
+                                           self._identity["name"]) + _SILENCE_OPTION,
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
@@ -2985,8 +2983,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         # read as one at all. Authorization is unchanged -- the gateway still
         # decides who may run what from the source we build below. The burst
         # boundary already puts a command first and alone, so burst[0] is it.
+        agent_name = self._identity["name"]
         turn_context = ("" if burst[0].starts_slash_command
-                        else _collaboration_turn_context(roster, sender, self._agent_display_name))
+                        else _collaboration_turn_context(roster, sender, agent_name))
         if not burst[0].starts_slash_command:
             quotes = [_quoted_reply_context(m.reply_to, roster) for m in burst if m.reply_to]
             if quotes:
@@ -3000,12 +2999,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{_referrer_block(self._referred_by)}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _channel_prompt(chat, role, roster, self._identity, self._agent_display_name)
+        channel_prompt = _channel_prompt(chat, role, roster, self._identity, agent_name)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
         # that capability is never ambient.
-        if _goal_peer_should_stay_silent(sender, roster, spoken, goal, self._agent_display_name):
+        if _goal_peer_should_stay_silent(sender, roster, spoken, goal, agent_name):
             channel_prompt = f"{_GOAL_PEER_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,
