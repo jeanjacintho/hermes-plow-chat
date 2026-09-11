@@ -5658,15 +5658,9 @@ async def test_a_direct_goal_reply_that_does_not_land_is_not_acknowledged(
 
     with pytest.raises(RuntimeError):
         await adapter._goal_command("cht_a", command, role, None, "msg_cmd")
-def test_latch_section_renders_only_when_a_mac_is_connected(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Hermes drops MCP `instructions`, so the plugin is what tells a Hermes
-    agent that the plow_ tools are the owner's Mac and the default for owner
-    work. plow-init exports PLOW_MCP_URL exactly when a Mac exists; without
-    it the section renders empty and Hermes skips it."""
-    module = _load(monkeypatch, tmp_path)
+def _registered_prompt_sections(module: Any) -> dict[str, Any]:
+    """register() the plugin against a minimal context and return the prompt
+    sections it registered, by id."""
     sections: dict[str, Any] = {}
 
     class _Context:
@@ -5681,7 +5675,19 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
             sections[id] = content
 
     module.register(_Context())
-    render = sections["plow-latch"]
+    return sections
+
+
+def test_latch_section_renders_only_when_a_mac_is_connected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Hermes drops MCP `instructions`, so the plugin is what tells a Hermes
+    agent that the plow_ tools are the owner's Mac and the default for owner
+    work. plow-init exports PLOW_MCP_URL exactly when a Mac exists; without
+    it the section renders empty and Hermes skips it."""
+    module = _load(monkeypatch, tmp_path)
+    render = _registered_prompt_sections(module)["plow-latch"]
 
     monkeypatch.delenv("PLOW_MCP_URL", raising=False)
     assert render({}) == ""
@@ -5691,7 +5697,24 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     assert text == module.LATCH_PROMPT
     assert len(text) <= 4000, "Hermes skips a section over max_chars"
     for must in ("Latch", "plow_list_skills", "plow_", "not connected",
-                 "plow_list_chats", "plow_send_message", "Messages app"):
+                 "plow_list_chats", "plow_send_message", "Messages app",
+                 # What the tools are for, in jobs rather than tool names, and
+                 # that earlier agents' work persists on the Mac: an agent that
+                 # knew only the possessive rule searched its own sessions for
+                 # "did Plow do X for me" and declared it out of reach.
+                 "end to end", "plow_history",
+                 # Measured on a real agent with the real Latch tool list
+                 # (2026-09-11): three prompt variants that stated the rule
+                 # mid-section went 0/4 on a first-turn Mac read; the same
+                 # rule as the section's opening sentence, phrased as the
+                 # turn's first tool call, went 3/3.
+                 "your first tool call is on their "
+                 "Mac",
+                 # A/B on the real tool list (2026-09-11): the deferral above got the
+                 # agent to call plow_list_skills and then answer "no" over the
+                 # manifest; the listing has to be read as a table of contents.
+                 "read it with plow_read_skill and do what it says in the same turn",
+                 "until a plow_ tool has looked"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
@@ -5700,6 +5723,42 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     # be a second owner to drift.
     for must_not in ("authorship as well as authority", "as yourself"):
         assert must_not not in text
+
+
+def test_mac_skills_section_renders_the_manifest_as_prompt_text(monkeypatch, tmp_path):
+    """The Mac's skill descriptions are the routing instructions for its
+    stores; read through the tool they arrive as untrusted data, so the
+    plugin renders them into the trusted prompt. No Mac, no section; a fetch
+    that fails renders nothing and never raises into the prompt builder."""
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.delenv("PLOW_MCP_URL", raising=False)
+    render = _registered_prompt_sections(module)["plow-latch-skills"]
+    assert render({}) == ""
+
+    manifest = [
+        {"name": "imessage", "description": "Read and send the owner's iMessages rather than answering that you cannot see their messages."},
+        {"name": "google-workspace", "description": "Read and act on the owner's Gmail and Google Calendar."},
+    ]
+    text = module._render_mac_skills(manifest)
+    assert text.startswith(module.MAC_SKILLS_HEAD)
+    assert "- imessage: Read and send the owner's iMessages" in text
+    assert "- google-workspace:" in text
+    assert "plow_read_skill" in text and "before session_search" in text
+    assert module._render_mac_skills([]) == ""
+    # A manifest past Hermes' 4000-char cap is cut, never skipped whole.
+    big = [{"name": f"skill{i}", "description": "x" * 900} for i in range(30)]
+    trimmed = module._render_mac_skills(big)
+    assert len(trimmed) <= 4000 and "- skill0: " in trimmed
+
+    # The section serves the cache; a refresh that fails leaves it empty.
+    monkeypatch.setenv("PLOW_MCP_URL", "https://api.plow.co/v1/relay/devices/u/mcp")
+    monkeypatch.setenv("PLOW_AGENT_TOKEN", "t")
+    monkeypatch.setattr(module, "_fetch_mac_skills", lambda url, token, timeout=8.0: (_ for _ in ()).throw(OSError("off")))
+    module._refresh_mac_skills()
+    assert render({}) == ""
+    monkeypatch.setattr(module, "_fetch_mac_skills", lambda url, token, timeout=8.0: manifest)
+    module._refresh_mac_skills()
+    assert render({}) == text
 
 
 def _stub_mirror(
