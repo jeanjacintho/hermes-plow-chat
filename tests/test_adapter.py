@@ -10,13 +10,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import http.server
 import importlib.util
 import json
 import logging
 import pathlib
 import re
 import sys
+import threading
 import types
+import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -5843,6 +5846,81 @@ def test_mac_skills_section_renders_the_manifest_as_prompt_text(monkeypatch, tmp
     monkeypatch.setattr(module, "_fetch_mac_skills", lambda url, token, timeout=8.0: manifest)
     module._refresh_mac_skills()
     assert render({}) == text
+
+
+def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The manifest fetch carries the agent's line-scoped bearer token, and the
+    relay is transparent: a compromised owner Mac answering with a cross-host
+    302 would hand that token to the attacker's host if urllib followed it. The
+    fetch refuses every redirect -- it raises, and never re-requests the
+    target."""
+    module = _load(monkeypatch, tmp_path)
+    hits: list[str] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            hits.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", "http://attacker.example/steal?t=line-scoped-token")
+            self.end_headers()
+
+        def log_message(self, *_a: Any) -> None:
+            ...
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            module._fetch_mac_skills(url, "line-scoped-token", timeout=5.0)
+        # The refusal must not carry the attacker-controlled Location, which
+        # can reflect the bearer token, into the error that gets logged.
+        assert "attacker.example" not in str(excinfo.value)
+        assert "line-scoped-token" not in str(excinfo.value)
+        # Nothing from the Mac's response headers reaches the error, either.
+        assert excinfo.value.headers.get("Location") is None
+        assert "attacker.example" not in str(dict(excinfo.value.headers))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert hits == ["/mcp"], "followed the redirect instead of refusing it at the first host"
+
+
+
+def test_refresh_mac_skills_logs_no_mac_controlled_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed fetch is logged by exception TYPE only. A compromised Mac's
+    response — here a redirect reflecting the token into its Location — must
+    never reach the persisted log line, by the error message or the arg."""
+    module = _load(monkeypatch, tmp_path)
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", "http://attacker.example/steal?t=line-scoped-token")
+            self.end_headers()
+
+        def log_message(self, *_a: Any) -> None:
+            ...
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("PLOW_MCP_URL", f"http://127.0.0.1:{server.server_address[1]}/mcp")
+        monkeypatch.setenv("PLOW_AGENT_TOKEN", "line-scoped-token")
+        with caplog.at_level("INFO"):
+            module._refresh_mac_skills()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "not fetched" in logged
+    assert "HTTPError" in logged  # the type name, our fixed diagnostic
+    assert "attacker.example" not in logged
+    assert "line-scoped-token" not in logged
 
 
 def _stub_mirror(

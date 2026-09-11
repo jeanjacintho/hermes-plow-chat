@@ -19,6 +19,7 @@ import re
 import stat
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -919,6 +920,38 @@ MAC_SKILLS_RETRY_S = 60
 _mac_skills: dict[str, Any] = {"text": "", "fetched_at": 0.0, "tried_at": 0.0, "lock": threading.Lock()}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The manifest fetch carries the agent's line-scoped bearer token. The
+    relay is transparent, so a compromised owner Mac could answer with a
+    cross-host 3xx and urllib would re-send that Authorization header to the
+    attacker's host. Refuse every redirect: this endpoint is fixed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Refuse by raising from here (urllib's documented refusal idiom), with
+        # fp closed and fp=None on the error: the socket is not left for the GC
+        # (returning None instead defers to http_error_default, which raises
+        # carrying the undrained response), and the attacker-controlled Location
+        # (which can reflect the bearer token) never reaches the error or its log.
+        try:
+            fp.close()
+        except Exception:  # noqa: BLE001 -- a reset already freed the socket
+            pass
+        # Empty headers, not the Mac's: the response headers carry the
+        # attacker-controlled Location (which can reflect the bearer token) and
+        # ride HTTPError.hdrs into e.headers / e.info(). An empty Message keeps
+        # every field of the error free of anything from the Mac's response.
+        # Imported here, not at module top: a module-level `import email.message`
+        # binds the name `email`, which collides with this package's own `email`
+        # submodule (imported as plow_email) and breaks the plugin's import —
+        # observed as an ImportError across the whole suite.
+        from email.message import Message
+        raise urllib.error.HTTPError(
+            req.full_url, code, "refusing redirect", Message(), None)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _fetch_mac_skills(url: str, token: str, timeout: float = 8.0) -> list[dict[str, str]]:
     """One JSON-RPC tools/call of plow_list_skills through the relay. Latch's
     server is stateless (no initialize, JSON responses), so this is the whole
@@ -932,7 +965,7 @@ def _fetch_mac_skills(url: str, token: str, timeout: float = 8.0) -> list[dict[s
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
         raw = resp.read().decode()
     if raw.lstrip().startswith("event:") or "\ndata:" in raw or raw.startswith("data:"):
         raw = "\n".join(line[5:].strip() for line in raw.splitlines() if line.startswith("data:"))
@@ -963,7 +996,7 @@ def _refresh_mac_skills() -> None:
     try:
         text = _render_mac_skills(_fetch_mac_skills(url, token))
     except Exception as e:  # noqa: BLE001 -- a Mac that is off is the ordinary case
-        log.info("plow_chat: Mac skill manifest not fetched (%s); Latch section carries no skills yet", e)
+        log.info("plow_chat: Mac skill manifest not fetched (%s); Latch section carries no skills yet", type(e).__name__)
         return
     with _mac_skills["lock"]:
         _mac_skills["text"] = text
