@@ -3,6 +3,7 @@
 """Hermes platform adapter for Plow Chat.
 
 Receives granted-scope WSS events and sends replies through the chat REST API.
+The transport itself -- credential, socket, reach -- is `_transport.py`, written to be shared with the email platform tracked in plow-pbc/hermes-plugin-plow#109.
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
@@ -42,7 +43,29 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 
-BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
+from ._transport import (
+    BASE,
+    _NEVER_GUESS,
+    _PlowAuthError,
+    _agent_name,
+    _auth_raise_for_status,
+    _bearer,
+    _chat_type,
+    _granted_chats,
+    _is_solo_dm,
+    _one_line,
+    _owner_fact,
+    _owner_identity,
+    _participant_identity,
+    _read_identity,
+    _represented_member,
+    _self_agent_line,
+    _serve,
+    _socket,
+    _split,
+    _ticket,
+)
+
 LATCH_URL = "https://plow.co/latch"
 # How long a QUIET answer from /v1/agents/me serves the gate below. Only the
 # quiet answer is cached: withholding while the owner has already turned
@@ -65,6 +88,7 @@ _WORKING_PREFIX = "⏳ Working —"
 _NO_REPLY_PREFIX = "⚠️ No reply: "
 _DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
+PROVIDER = "linq"                     # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -125,34 +149,6 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
-def _self_agent_line(chat):
-    """The self agent participant's line dict, {} when the roster lacks one."""
-    agent = next((p for p in chat.get("participants") or []
-                  if p.get("type") == "agent"
-                  and p.get("relationship") in (None, "self")), {})
-    return agent.get("line") or {}
-
-
-def _agent_name(chat):
-    """The line's persona name ("Elm"), or None for an unnamed line.
-
-    Read from the chat's own agent participant, so the DB stays the single
-    identity source and a rename needs no reprovision — it lands at the next
-    reach refresh (reconnect or group-send adoption), which is deliberate: a
-    rename is a rare coordinated ops event (it ships a new vCard too), not
-    worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
-    of the listing readers: a pre-persona server omits `line`, and an unnamed
-    line omits `display_name`.
-    """
-    return _self_agent_line(chat).get("display_name") or None
-
-
-def _represented_member(chat, agent):
-    uid = agent.get("represents_participant_uid")
-    return next((p for p in chat.get("participants") or []
-                 if p.get("type") == "member" and p.get("uid") == uid), None)
-
-
 # The owner asked for "3 nights that work for me" and the agent answered in
 # the owner's own voice: nothing said whose voice this is. This names it --
 # the concrete mapping ("Elm represents Samuel Odio") already reaches the
@@ -170,7 +166,6 @@ _RELATIONSHIP_FACT = (
 # fact's clothes, and it gets written to the contact book as one. Once: the
 # tool makes the answer durable across every thread, so re-asking is a tell
 # that the agent never recorded it.
-_NEVER_GUESS = "Never guess a name from mail, calendar, or memory."
 _NAME_FACT = (
     "If anyone in the roster shows as a bare handle, your owner included, ask their name once and "
     f"record it with plow_name_contact. {_NEVER_GUESS}"
@@ -205,19 +200,6 @@ def _speaker_name(sender, chat):
     return sender.get("display_name") or sender.get("uid") or "a member", "human participant"
 
 
-def _is_solo_dm(chat):
-    """A 1:1 thread: one human, and no peer agent to collaborate with.
-
-    The gate for the roster prefix. NOT "has no peer" on its own -- a
-    human-only group has several people who can speak and a current speaker
-    the model needs to tell apart, even with no other agent in the room.
-    """
-    participants = chat.get("participants") or []
-    if any(p.get("type") == "agent" and p.get("relationship") == "peer" for p in participants):
-        return False
-    return sum(1 for p in participants if p.get("type") == "member") <= 1
-
-
 def _owner_dm(chat):
     """The owner's own 1:1 with this agent: a solo DM (one human, no peer
     agent listening) whose human is the owner. The shape that may hold
@@ -237,7 +219,7 @@ def _owner_dm(chat):
 def _chat_summary(chat):
     """One chat resource, reduced to what picking a room actually takes.
 
-    `kind` is `_is_solo_dm`'s answer, so a room holding one human and a peer
+    `kind` is `_chat_type`'s answer, so a room holding one human and a peer
     agent reads as a group -- the same call every other gate here makes, and
     the reason it is not "count the humans".
 
@@ -256,7 +238,7 @@ def _chat_summary(chat):
     provider_roster = ", ".join(p["provider_key"] for p in members)
     summary = {
         "chat_id": chat["uid"],
-        "kind": "dm" if _is_solo_dm(chat) else "group",
+        "kind": _chat_type(chat),
         "trusted": bool(chat.get("trusted", False)),
         "participants": [{"name": _participant_identity(p), "handle": p["provider_key"]}
                          for p in members],
@@ -604,45 +586,6 @@ def _goal_wake_generation(message_id):
     """
     parts = str(message_id or "").split("-")
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
-
-
-def _owner_identity(chat):
-    """The owner's name and handle, off the chat every owner turn refreshes.
-
-    The chat resource carries its owner as a participant -- name, handle and
-    role -- in a solo DM as much as a group, even though a DM renders no roster
-    BLOCK. So there is nothing to fetch: the turn already re-read the one
-    resource that answers this, and a name the owner changes lands on their
-    very next turn with no cache and no second request.
-
-    No default on the `next`: `role == "owner"` is how this turn was chosen in
-    the first place, so a chat that then has no owner participant is a broken
-    contract, not a case to render around.
-    """
-    owner = next(p for p in chat.get("participants") or []
-                 if p.get("type") == "member" and p.get("role") == "owner")
-    # `_participant_identity` already answers "named, or still a bare handle?"
-    # -- it hands back the handle itself when there is no meaningful name.
-    handle = _one_line(owner.get("provider_key"))
-    name = _participant_identity(owner)
-    return (None if name == handle else name, handle)
-
-
-def _owner_fact(owner):
-    """What an owner turn is told about its own owner.
-
-    A roster block reaches the model on an inbound burst and nowhere else, so
-    the owner's own DM -- the room onboarding actually happens in -- and every
-    goal wake have no source at all for who their owner is. _NAME_FACT does not
-    reach them either: it is gated on there being a roster to read. This is
-    that source, and when the name is still missing it carries the ask, with
-    the handle already filled in so there is nothing left to guess.
-    """
-    name, handle = owner
-    if name:
-        return f"Your owner is {name} [{handle}]."
-    return (f"Your owner [{handle}] has not given their name yet: ask once and record it with "
-            f"plow_name_contact(handle={handle}). {_NEVER_GUESS}")
 
 
 def _channel_prompt(chat, role, roster, identity):
@@ -1062,24 +1005,6 @@ def _with_identity(prompt, name, identity):
     return f"{who} {_plow_facts(identity)} {prompt}"
 
 
-def _one_line(text):
-    """A person-supplied name, made safe to interpolate.
-
-    Whitespace collapses to single spaces -- a newline in a name opens a line
-    that reads like a fresh instruction, which matters most where the name
-    lands in system authority -- and the result is capped, so no one name can
-    crowd out the prompt it sits in. Empty is empty; each caller owns its own
-    fallback.
-    """
-    return " ".join(str(text or "").split())[:100]
-
-
-def _participant_identity(participant):
-    """Choose a one-line server identity: meaningful name, then full handle."""
-    handle = str(participant.get("provider_key") or "").strip()
-    display = _one_line(participant.get("display_name"))
-    return display if display and display != handle else handle
-
 # The connected adapter and the loop its listener task runs on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
 # coroutine a throwaway loop on a throwaway thread — a task created there dies
@@ -1112,22 +1037,6 @@ class _Inbound:
     reply_to: dict | None = None
 
 
-class _PlowAuthError(Exception):
-    """The credential itself was refused (401). Terminal: every retry presents
-    the same revoked token, so the caller must stop, not sleep."""
-
-
-def _auth_raise_for_status(resp):
-    """The one status seam for every request that presents the credential.
-
-    Status BEFORE parse (a proxy 401 is not JSON), and 401 ONLY -- a 403 is
-    resource-scoped (removed from one chat) and keeps warn-and-retry.
-    """
-    if resp.status == 401:
-        raise _PlowAuthError
-    resp.raise_for_status()
-
-
 def _platform():
     """Resolve the Platform member LAZILY, never at import.
 
@@ -1146,11 +1055,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=_platform())
         self._configured_home_chat_uid = os.environ["PLOW_HOME_CHANNEL"]
         self.home_chat_uid = self._configured_home_chat_uid
-        self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
+        self.auth = _bearer()
         self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
+        self._foreign = frozenset()          # granted uids another platform serves
         self._chats = {
             self.home_chat_uid: {
                 "uid": self.home_chat_uid,
@@ -1242,9 +1152,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             self._typing_until_reply(chat_uid, initial_delay=initial_delay))
 
     def _set_reach(self, chats):
-        next_chats = {chat["uid"]: chat for chat in chats}
+        next_chats, foreign = _split(chats, PROVIDER)
         if not next_chats:
-            raise RuntimeError("the credential grant has no live chats")
+            raise RuntimeError("the credential grant has no live phone-line chats")
         # The home is where cron and default output land. A fallback to "some
         # granted room" pointed the owner's private deliveries at whichever
         # chat the API listed first -- refuse instead; _listen retries, and the
@@ -1259,6 +1169,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.home_chat_uid = next_home
         self._chats = next_chats
         self.chat_uids = frozenset(next_chats)
+        self._foreign = foreign
         self._anchored_chats = {
             chat_uid: self._checkpoint_path(chat_uid).exists()
             for chat_uid in self.chat_uids
@@ -1282,30 +1193,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         """Discover the token's grant-scoped reach. The home is fixed by
         PLOW_HOME_CHANNEL -- a grant that drops it is refused in _set_reach."""
         try:
-            async with http.get(f"{BASE}/v1/chats", headers=self.auth) as resp:
-                _auth_raise_for_status(resp)
-                body = await resp.json(content_type=None)
-            if body["has_more"]:
-                raise RuntimeError("the granted chat listing is truncated")
-            self._set_reach(body["data"])
-            # Who this agent is, for the prompt prefix. Only a 200 sets it:
-            # refresh has no timer (connect, group creation, an unknown-chat
-            # frame), so overwriting on a failure would let one blip strip the
-            # offer for the life of a healthy socket.
-            async with http.get(f"{BASE}/v1/agents/cloud/me", headers=self.auth) as resp:
-                if resp.status == 200:
-                    me = await resp.json(content_type=None)
-                    self._identity = {"signup": me.get("signup"),
-                                      "number": (me.get("line") or {}).get("provider_key")}
-                elif resp.status != 404:
-                    # 404 is the documented "this token is not one agent" -- a
-                    # wildcard or multi-line grant -- and keeps what we hold.
-                    # Anything else is not an answer about identity: through the
-                    # credential seam (a 401 is terminal), then fail the refresh
-                    # like the grant read above so _listen retries, rather than
-                    # silently running without the offer.
-                    _auth_raise_for_status(resp)
-                    raise RuntimeError(f"the identity read returned HTTP {resp.status}")
+            self._set_reach(await _granted_chats(http, self.auth))
+            # Who this agent is, for the prompt prefix. Only a 200 sets it
+            # (`_read_identity` answers None on the documented 404): refresh
+            # has no timer (connect, group creation, an unknown-chat frame),
+            # so overwriting on a failure would let one blip strip the offer
+            # for the life of a healthy socket.
+            me = await _read_identity(http, self.auth)
+            if me is not None:
+                self._identity = me
         except _PlowAuthError:
             raise                              # terminal; _listen owns the stop
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
@@ -2514,11 +2410,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         A live read of the same `GET /v1/chats` that feeds reach, not the
         cached copy: reach is refreshed at connect, reconnect and group
         adoption only, so a room retitled or joined mid-connection is stale
-        there and current here. The grant is the scope for WHICH rooms appear
-        -- the credential cannot see a chat it does not hold -- so no
-        narrowing is done on that axis.
+        there and current here. The grant decides which rooms the credential
+        can see; the listing then narrows that to the phone line's own chats
+        (`provider == "linq"`), excluding chats of another provider on the
+        same grant.
 
-        Status is the one narrowing, because the listing exists to source a
+        Status is the other narrowing, because the listing exists to source a
         `cht_` id for `plow_send_message`. `/v1/chats` excludes only `failed`,
         so it serves `pending` rooms too; the send path requires `active` and
         answers a pending one with `409 chat_not_ready`. Listing an id that
@@ -2544,7 +2441,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # never been status-filtered, and narrowing it here would quietly
         # unsubscribe the pending rooms this tool merely declines to advertise.
         self._set_reach(body["data"])
-        return listed
+        return [chat for chat in listed if chat["chat_id"] in self.chat_uids]
 
     async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
@@ -2572,13 +2469,8 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id):
         chat = self._chats[chat_id]
-        # `_is_solo_dm` is the one answer to "is anyone else in this room?", and
-        # it counts a peer agent as somebody. Counting humans alone called a
-        # room holding one human and another household's agent a DM, which
-        # handed its scheduled wake owner authority over peer-written content.
-        chat_type = "dm" if _is_solo_dm(chat) else "group"
         name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
-        return {"name": name, "type": chat_type, "chat_id": chat_id,
+        return {"name": name, "type": _chat_type(chat), "chat_id": chat_id,
                 "trusted": bool(chat.get("trusted", False))}
 
     async def _home_line_uid(self):
@@ -2720,131 +2612,87 @@ class PlowChatAdapter(BasePlatformAdapter):
         global _live
         first_connection = True
         # Durable across restarts, unlike `first_connection`: `connect`
-        # unconditionally refreshes reach before ever starting this loop
-        # (`__init__`'s own checkpoint read stands in for a raw `_listen`
-        # call with no `connect`), so `_anchored_chats` already reflects,
-        # by the time this runs, every chat currently granted -- including
-        # one this agent discovered in a PRIOR life and never finished
-        # anchoring. `first_connection` alone cannot tell that case apart
-        # from a genuine first-ever install: it is always true for a fresh
-        # process regardless of which life this is. The home checkpoint
-        # already existing on disk is what actually means "not the first
-        # life" -- read once, here, before anything below can change it.
+        # refreshes reach before starting this loop, so `_anchored_chats`
+        # already reflects every granted chat -- including one discovered in
+        # a PRIOR life and never finished anchoring. The home checkpoint
+        # existing on disk is what means "not the first life"; read once,
+        # here, before anything below can change it.
         first_install = not self._anchored_chats.get(self.home_chat_uid)
-        while True:
-            try:
-                async with aiohttp.ClientSession() as http:
-                    if not first_connection:
-                        await self._refresh_reach(http)
-                    # Mint immediately before connecting: the ticket lives 60s
-                    # and is single-use, and revocation is re-checked at
-                    # consume, so a cached one is a 4401 close.
-                    async with http.post(f"{BASE}/v1/ws/ticket",
-                                         json={},
-                                         headers=self.auth) as resp:
-                        _auth_raise_for_status(resp)
-                        ticket = (await resp.json(content_type=None))["ticket"]
-                    # ONE gate decides newest vs empty for every chat this
-                    # agent ever anchors: `first_connection and first_install`
-                    # -- this process's first connect, AND this agent's
-                    # genuine first-ever life. Snapshotted and
-                    # `first_connection` consumed BEFORE the loop below, not
-                    # after: a genuine first install can anchor several
-                    # chats, and `_ensure_anchor` raises on a checkpoint-write
-                    # failure partway through -- a real turn can then land
-                    # server-side in the 5s before `_listen` retries. Reading
-                    # `first_connection` again on that retry would still see
-                    # it true and newest-anchor the chats this attempt never
-                    # reached. Consumed here, a retry always anchors empty
-                    # instead, same as every other case (see `_ensure_anchor`
-                    # for why empty is always the safe default).
-                    newest_anchor = first_connection and first_install
-                    first_connection = False
-                    # `http` only when newest_anchor: `_ensure_anchor` reads
-                    # the newest uid itself, under its own lock, so a
-                    # concurrent empty anchor for the same chat_uid (a
-                    # `start_group_thread` call racing this very first
-                    # connect) can never land between a read taken here and
-                    # a write made there. Before the socket either way,
-                    # never inside it -- reading after `ws_connect` races
-                    # the frames that connection is already buffering.
+
+        async def session(http):
+            nonlocal first_connection
+            global _live
+            if not first_connection:
+                await self._refresh_reach(http)
+            ticket = await _ticket(http, self.auth)
+            # ONE gate decides newest vs empty for every chat this agent ever
+            # anchors: this process's first connect AND this agent's genuine
+            # first-ever life. Snapshotted and `first_connection` consumed
+            # BEFORE the loop: `_ensure_anchor` raises on a checkpoint-write
+            # failure partway through, and a retry must anchor the chats
+            # this attempt never reached empty, never newest.
+            newest_anchor = first_connection and first_install
+            first_connection = False
+            # `http` only when newest_anchor: `_ensure_anchor` reads the
+            # newest uid itself, under its own lock, so a concurrent
+            # `start_group_thread` empty anchor for the same chat_uid cannot
+            # land between a read taken here and a write made there. Before
+            # the socket, never inside it -- reading after `ws_connect` races
+            # the frames that connection is already buffering.
+            for chat_uid in self.chat_uids:
+                await self._ensure_anchor(chat_uid, http if newest_anchor else None)
+            # Published only now, after every chat known at this connect has
+            # been through the anchor decision -- never in `connect`, where
+            # publishing let a tool call's bridged coroutine reach
+            # `_ensure_anchor` before this task had run. Cleared in
+            # `disconnect` and after `_serve` returns. Republishing the same
+            # `_live` tuple on every reconnect is harmless: same adapter, same
+            # loop for its whole life.
+            _live = (self, asyncio.get_running_loop())
+            async with _socket(http, ticket) as ws:
+                self._mark_connected()
+                log.info("[plow_chat] websocket connected")
+                try:
                     for chat_uid in self.chat_uids:
-                        await self._ensure_anchor(chat_uid, http if newest_anchor else None)
-                    # Published only now, after every chat known at this
-                    # connect has been through the anchor decision above --
-                    # never in `connect`, where publishing let the
-                    # synchronous tool handler's bridged call reach
-                    # `_ensure_anchor` before this task had even run,
-                    # racing (and potentially winning) the newest-vs-empty
-                    # decision for a chat this pass was about to
-                    # newest-anchor. Republishing the same tuple on every
-                    # reconnect is harmless -- this task's own loop, same
-                    # adapter, same event loop for its whole life. Cleared
-                    # in `disconnect` and in the auth-terminal branch below.
-                    _live = (self, asyncio.get_running_loop())
-                    url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
-                    async with http.ws_connect(url, heartbeat=30) as ws:
-                        self._mark_connected()
-                        log.info("[plow_chat] websocket connected")
-                        try:
-                            for chat_uid in self.chat_uids:
-                                await self._backfill(http, chat_uid)
-                            # Armed only now. A resumed goal's first attempt has
-                            # no backoff, and each wake waits out its own chat's
-                            # backlog before acting, so it cannot run ahead of an
-                            # offline `/goal clear` still sitting in the queue.
-                            self._goal_arm_wakes()
-                            async for frame in ws:
-                                if frame.type == aiohttp.WSMsgType.TEXT:
-                                    await self._on_frame(frame.json(), http)
-                        finally:
-                            # Paced work does not outlive the session that can
-                            # deliver instructions to stop it.
-                            self._goal_pause_wakes()
-            except _PlowAuthError:
-                # Revocation is terminal: every retry presents the same dead
-                # credential. Observed on the str agent 2026-08-27 -- one
-                # WARNING a minute, the line dead, the adapter reporting itself
-                # connected. State first, then the tool handle: a confirmed
-                # group send against a retired credential must refuse, not
-                # invoke this adapter. (Re-port of #17 onto this structure.)
-                log.error("[plow_chat] credential refused (401) -- stopping the "
-                          "listen loop; re-credential this agent")
-                self._mark_disconnected()
-                if _live is not None and _live[0] is self:
-                    _live = None
-                return
-            except Exception as exc:         # noqa: BLE001 - reconnect, never die
-                # TYPE only: the ticket is a query parameter, so a non-101
-                # handshake raises an exception carrying the whole URL, and
-                # that ticket is still live.
-                log.warning("[plow_chat] websocket error: %s", type(exc).__name__)
-                self._mark_disconnected()
-            await asyncio.sleep(5)
+                        await self._backfill(http, chat_uid)
+                    # Armed only now: each wake waits out its own chat's
+                    # backlog, so it cannot run ahead of an offline `/goal
+                    # clear` still sitting in the queue.
+                    self._goal_arm_wakes()
+                    async for frame in ws:
+                        if frame.type == aiohttp.WSMsgType.TEXT:
+                            await self._on_frame(frame.json(), http)
+                finally:
+                    # Paced work does not outlive the session that can
+                    # deliver instructions to stop it.
+                    self._goal_pause_wakes()
+
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+        # Terminal. State first (`_serve` marked us disconnected), then the
+        # tool handle: a confirmed group send against a retired credential
+        # must refuse, not invoke this adapter. (Re-port of #17.)
+        if _live is not None and _live[0] is self:
+            _live = None
 
     async def _on_frame(self, frame, http=None):
         if frame.get("type") == "connected":
             return
         chat_uid = frame["chat_id"]
-        if chat_uid not in self.chat_uids:
-            # A chat this agent has never seen -- one born after connect, or
-            # a `message_received` for one never seen. One refresh re-reads
-            # the grant's reach, ahead of the event_type gate below: a
-            # chat_created frame has no message to deliver, but still needs
-            # the reach update. A refresh failure propagates to `_listen`'s
-            # existing reconnect seam -- the same recovery already in place
-            # for a dropped socket, not a second one.
-            #
-            # No anchor call here: baselining a chat discovered mid-connection
-            # is `_listen`'s per-connect loop's job now, not this call's --
-            # see its comment for why that is the one place newest-vs-empty
-            # gets decided. Until that next connect, delivery below does not
-            # need one (the queue does not check `_anchored_chats`), and a
-            # message that lands acks its own real baseline via `_deliver`.
+        if chat_uid not in self.chat_uids and chat_uid not in self._foreign:
+            # A chat this agent has never seen -- one born after connect. One
+            # refresh re-reads the grant's reach, ahead of the event_type gate
+            # below: a chat_created frame has no message to deliver, but still
+            # needs the reach update. A refresh failure propagates to
+            # `_listen`'s reconnect seam. No anchor call here: baselining a
+            # chat discovered mid-connection is `_listen`'s per-connect loop's
+            # job, and a message that lands acks its own baseline in `_deliver`.
             await self._refresh_reach(http)
-            if chat_uid not in self.chat_uids:
-                log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
-                return
+        if chat_uid in self._foreign:
+            log.debug("[plow_chat] frame for %s belongs to another platform", chat_uid)
+            return                           # the email line's thread; plow_email's turn
+        if chat_uid not in self.chat_uids:
+            log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
+            return
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]

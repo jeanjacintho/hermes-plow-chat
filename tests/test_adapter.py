@@ -157,9 +157,18 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("PLOW_HOME_CHANNEL", "cht_a")
     monkeypatch.setenv("PLOW_AGENT_TOKEN", "plow_tok")  # pragma: allowlist secret — a fixture string
-    spec = importlib.util.spec_from_file_location("plow_chat_under_test", PLUGIN)
+    # The plugin directory is one package (hermes_cli.plugins_loader passes
+    # submodule_search_locations), so `__init__` may import its siblings
+    # relatively. Register the package before its body runs -- that is where
+    # a relative import looks -- and evict the previous test's submodules
+    # first, or `from ._transport import` would keep serving that test's copy.
+    for name in [name for name in sys.modules if name.startswith("plow_chat_under_test.")]:
+        monkeypatch.delitem(sys.modules, name)
+    spec = importlib.util.spec_from_file_location(
+        "plow_chat_under_test", PLUGIN, submodule_search_locations=[str(PLUGIN.parent)])
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "plow_chat_under_test", module)
     spec.loader.exec_module(module)
     # Most adapter tests isolate a different seam and drive an already-cached
     # chat directly, without a REST server. Keep that canonical resource as
@@ -334,7 +343,7 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
                              "provider_key": "+15550000002"})
     return {"uid": uid, "display_name": name, "participants": participants,
-            "trusted": trusted, "status": status}
+            "trusted": trusted, "status": status, "provider": "linq"}
 
 
 def _voiced(module: Any, prompt: str) -> str:
@@ -396,6 +405,7 @@ def _peer_envelope(event_id: str, chat_id: str, message_id: str) -> dict[str, An
 def _collaboration_chat() -> dict[str, Any]:
     return {
         "uid": "cht_a",
+        "provider": "linq",
         "participants": [
             {
                 "type": "agent",
@@ -421,6 +431,7 @@ def _dm_chat() -> dict[str, Any]:
     """A 1:1 DM as the server actually lists it: the owner and us, no peer."""
     return {
         "uid": "cht_a",
+        "provider": "linq",
         "participants": [
             {
                 "type": "agent",
@@ -1934,6 +1945,65 @@ async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
             await adapter._refresh_reach(_ReachAndMeHTTP())
 
     assert adapter._identity == {"signup": SIGNUP, "number": NUMBER}
+
+
+async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An email thread is a chat on the same grant (plow-pbc/hermes-plugin-plow#109), listed by the
+    same `GET /v1/chats` and carried by the same socket. It must never render
+    as an SMS room: reach, the send guard, the tool listing and the alias
+    registry see only `linq` chats, and a frame for a `gmail` chat is dropped
+    without the reach refresh an unknown chat costs and without the warning
+    an out-of-grant chat earns -- it is neither."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    mail = _chat("cht_mail", name="Re: invoice", group=True) | {"provider": "gmail"}
+    listing = {"object": "list", "has_more": False, "data": [_chat("cht_a"), mail]}
+
+    class _GrantHTTP:
+        def __init__(self) -> None:
+            self.gets = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Resp:
+            self.gets += 1
+            return _Resp(listing if url.endswith("/v1/chats") else {}, status=200 if url.endswith("/v1/chats") else 404)
+
+    http = _GrantHTTP()
+    await adapter._refresh_reach(http)
+    assert adapter.chat_uids == frozenset({"cht_a"})
+    assert adapter._send_guard("cht_mail") is not None, "an email thread is not a room to send to"
+    assert adapter._foreign == frozenset({"cht_mail"})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _ChatResourceHTTP(_Resp(listing)))
+    assert [chat["chat_id"] for chat in await adapter.list_chats()] == ["cht_a"]
+
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+    reads_before = http.gets
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(_envelope("evt_mail", "cht_mail", "msg_mail"), http)
+    await _settle(adapter)
+    assert handled == [], "the email line's turn is plow_email's, never plow_chat's"
+    assert http.gets == reads_before, "a known-foreign chat costs no reach refresh"
+    assert "outside the grant" not in caplog.text
+
+
+def test_a_listing_without_provider_is_served_as_the_phone_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """`_provider` defaults an absent key to `linq` -- today's actual shape,
+    since plow does not yet serve the field on any chat, and this default
+    governs every chat on every deployed agent until it does. Pin the
+    observable outcome: a listing with no `provider` key at all is served as
+    the phone line entire, none of it foreign."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    legacy = [{k: v for k, v in _chat(uid).items() if k != "provider"}
+              for uid in ("cht_a", "cht_b")]
+    adapter._set_reach(legacy)
+    assert adapter.chat_uids == frozenset({"cht_a", "cht_b"})
+    assert adapter._foreign == frozenset()
 
 
 class _SocketHTTP(_HTTP):

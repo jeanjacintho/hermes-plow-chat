@@ -7,21 +7,16 @@ back through the chat REST API.
 ```
 plow-chat-platform/     exactly what gets installed, and nothing else
   plugin.yaml           the manifest -- registers the platform id
-  __init__.py           the adapter; Hermes loads it from the plugin root
+  __init__.py           the chat adapter and the tools; Hermes loads it from the plugin root
+  _transport.py         the transport the chat adapter runs, written to be shared with the email platform tracked in plow-pbc/hermes-plugin-plow#109
 tests/                  the adapter suite
 ```
 
 The directory is named for the plugin id so the install can be a directory copy:
-`agent-mgr` snapshots this repo at the pinned SHA and swaps `plow-chat-platform/`
-into place. Nothing else here — README, tests, justfile — reaches an agent.
+`plow-hermes-agent`'s Dockerfile fetches this repo at the pinned SHA and bakes
+`plow-chat-platform/` into the image. Nothing else here — README, tests, justfile — reaches an agent.
 
-> **Ordering.** That contract needs `agent-mgr`'s `install-plugin` to install
-> this *directory*, which it does only from
-> [`plow-pbc/agent-mgr#10`](https://github.com/plow-pbc/agent-mgr/pull/10) onward.
-> Before that change it copied two files from the repository **root**, so a
-> `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
-> `agent-mgr` installs an empty plugin directory — an agent with no phone line.
-> Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
+> **Ordering.** Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
 > and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
 > deploy both API changes before pinning this plugin, or reply context will be absent
 > or indexed media replies will remain unresolved.
@@ -42,10 +37,11 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
 > "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
-> invites, but skip the ask-owner-first invite flow. Deploy the API first,
-> then land the `agent-mgr` support above, and only then bump
-> `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
-> available fails loudly instead of silently skipping delivery.
+> invites, but skip the ask-owner-first invite flow. Deploy the API first, and
+> only then bump `PLOW_CHAT_PLUGIN_SHA` in `plow-hermes-agent` (and
+> `agent-mgr`'s `images.hermes_local` base tag, which can't move past it).
+> Installing this plugin before the API is available fails loudly instead of
+> silently skipping delivery.
 
 ## Where changes go
 
@@ -93,20 +89,12 @@ the base image every hosted Plow agent boots, pins one commit of this repo as
 build time. That is the production consumer. The Docker fleet below is the
 deprecated one.
 
-[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr) pins a SHA of this
-repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
-
-```sh
-agent-mgr install-plugin <name>     # or as part of `agent-mgr restore <name>`
-```
-
-It lands as two files in the agent's own home, and nothing else:
-
-```
-~/.hermes-<name>/plugins/plow-chat-platform/
-  __init__.py
-  plugin.yaml
-```
+[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr)'s Docker fleet
+gets this plugin the same way — bundled in that base image, not installed
+separately. Bumping `PLOW_CHAT_PLUGIN_SHA` there, pointing `runtime/stack.json`'s
+`images.hermes_local` at the new base, and running `agent-mgr deploy` moves the
+fleet. It lands at `/opt/hermes/plugins/plow_chat/` on the image, as the same
+three files and nothing else: `__init__.py`, `_transport.py`, `plugin.yaml`.
 
 **Pinned by SHA, never vendored.** A branch ref would silently re-point a running
 agent on the next push here, and this plugin holds the chat token. A vendored
@@ -121,7 +109,7 @@ URL in git.
 | var | required | meaning |
 |---|---|---|
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
-| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
+| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (provider `linq`). Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
@@ -423,15 +411,16 @@ API the inbound path sees no `attachments` field (a `KeyError`, loud, per
 REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
 the frame loop on every inbound message, so the socket is torn down and
 reconnected every 5s and the phone line is mute until the API catches up:
-`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
-until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+`PLOW_CHAT_PLUGIN_SHA` in `plow-hermes-agent` must not be bumped to this
+commit — and `agent-mgr`'s `images.hermes_local` base tag can't move past it
+— until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
 to.
 
 ## One implementation, two delivery paths
 
-This adapter is the only plow_chat implementation. `agent-mgr` installs it into
-Docker-fleet agents at the SHA pinned in its `runtime/plow-chat-plugin.ref`;
-`plow-pbc/plow`'s blessed exe.dev image bakes the same tree at the same pin.
+This adapter is the only plow_chat implementation; see Who consumes this
+above for the delivery paths. `plow-pbc/plow`'s blessed exe.dev image bakes
+the same tree at the same `PLOW_CHAT_PLUGIN_SHA` pin.
 The old second implementation in `plow`'s `cloud-agents/` was retired by the
 unification (`plow-pbc/plow#1420`); its multi-chat credential-scope design is
 what this adapter now is.
@@ -445,7 +434,7 @@ reference for the underlying Hermes behaviour.
 just test
 ```
 
-The suite loads `__init__.py` by path and stubs the `gateway.*` modules Hermes
+The suite loads the plugin directory as a package and stubs the `gateway.*` modules Hermes
 supplies at runtime, so it needs no Hermes install and touches no network.
 
 ## Provenance
