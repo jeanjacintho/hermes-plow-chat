@@ -169,10 +169,12 @@ async def test_an_email_turn_confines_the_chat_tools_and_never_sends_from_the_ow
     event = SimpleNamespace(source=SimpleNamespace(chat_id="cht_m", chat_type="dm",
                                                    role_authorized=role == "owner"))
     await mail.on_processing_start(event)
-    assert module._ACTIVE_TURN.get() == {"chat_uid": "cht_m", "owner": role == "owner", "dm": False}
+    owner = role == "owner"
+    assert module._ACTIVE_TURN.get() == {"chat_uid": "cht_m", "owner": owner, "dm": False,
+                                         "authority": owner, "email": True}
     contacts = json.loads(module._plow_contacts({}))
     assert contacts["success"] is False
-    assert ("member's turn" in contacts["error"]) == (role == "member")
+    assert ("without the owner's authority" in contacts["error"]) == (role == "member")
     gate = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
     assert gate["action"] == "block"
     await mail.on_processing_complete(event, None)
@@ -210,7 +212,8 @@ async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
     http = _HTTP(status=400 if posted and not success else 200)
     monkeypatch.setattr(module.plow_email.aiohttp, "ClientSession", lambda *a, **k: http)
     if turn:
-        module._ACTIVE_TURN.set({"chat_uid": turn[0], "owner": turn[1], "dm": False})
+        module._ACTIVE_TURN.set({"chat_uid": turn[0], "owner": turn[1], "dm": False,
+                                 "authority": turn[1], "email": True})
 
     result = await mail.send(target, body, metadata=metadata)
 

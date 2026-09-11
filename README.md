@@ -225,25 +225,27 @@ phone line.
 
 ### Group discretion and full trust
 
-The room mode is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
-Before handing off each inbound burst, the adapter refreshes that chat so a
-dashboard change applies to the next message. With discretion,
-the owner may use connected accounts and share what they ask for in the room;
-members may obtain owner material only within what the owner has okayed in this
-thread. A new kind of ask waits for the owner's yes here, with the model judging
-that consent from the conversation. With full trust enabled, members may use the
-owner's accounts without a per-ask okay; only what answers the request is disclosed.
-Both modes exclude credentials, authentication secrets, raw tokens and payment-card
-secrets. Email sends require owner-DM approval; calendar overrides follow the
-calendar-conflict rule, only in the owner's DM. Member turns cannot send to other
-chats, write contacts, set goals, or list the owner's other rooms.
-Groups the owner starts begin with full trust, without a trust question; groups
-another member starts begin with discretion. The owner can change either later.
+The room mode is an owner-scoped, per-chat preference served on `GET
+/v1/chats/{uid}`. Before handing off each inbound burst, the adapter refreshes that
+chat so a dashboard change applies to the next message. The owner's own turns carry
+the owner's authority everywhere -- a DM, an untrusted group, a trusted group. Trust
+is the one flag that extends it to anyone else: a human member's turn in a trusted
+group carries it, inside that group; it never follows them into a DM. A peer agent's
+turn and a goal wake have no human speaker, so trust grants them nothing. In
+discretion, a member's ask still waits for the owner's yes given in this thread,
+judged from the conversation, disclosing only what answers the request. A standing
+secret — a password, backup code, API key, raw token, or full card number — is
+refused regardless of authority. Email sends and calendar-conflict overrides need a
+turn with the owner's authority; an email's approval posts in the room that asked,
+and an override posts none. A turn without authority cannot send to other chats, set
+goals, or list the owner's other rooms, and only the owner's own turn writes
+contacts. Groups the owner starts begin trusted; groups another member starts begin
+with discretion, and only the owner can change that later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
-dashboard. It only succeeds during an owner-authored Plow Chat turn and after
-the model passes `confirm=true` for an explicit owner request. Member turns and
-calls outside an active chat turn cannot change it.
+dashboard; opening a trusted thread is owner-only too. Both only succeed on an owner-
+authored Plow Chat turn where the model passes `confirm=true` for an explicit owner
+request. Member turns and calls outside an active chat turn cannot change either.
 
 This plugin version requires a Plow API that publishes the required `trusted`
 chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
@@ -256,10 +258,11 @@ Hermes keeps one session per chat, and this adapter drops the echo of the
 agent's own sends. So a message the agent posts to chat B from a turn in chat
 A is invisible to chat B's next turn unless it is recorded there. The
 `plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
-through the adapter's `send()` like every other outbound message (the grant
-and member-turn confinement apply exactly as for a reply). `plow_list_chats`
-is where its `cht_` id comes from: a live `GET /v1/chats` — the same read that
-establishes reach, so the credential's grant is the whole listing — reduced to
+through the adapter's `send()` like every other outbound message (the grant,
+and the confinement of a turn without the owner's authority, apply exactly as
+for a reply). `plow_list_chats` is where its `cht_` id comes from: a live `GET
+/v1/chats` — the same read that establishes reach, so the credential's grant
+is the whole listing — reduced to
 id, kind, title, the humans by name and handle, and trust. Only `active` rooms
 are listed. The route excludes just `failed`, so it serves rooms still being
 set up as well; `send` requires `active` and answers a pending one with `409
@@ -268,10 +271,11 @@ no business offering a choice that fails. Titles and names in
 it are other people's words, so the result carries the same untrusted marker
 every such block does; a title the provider defaulted to the room's own
 comma-joined handles is dropped, because that column is how the API says
-"nobody named this". It is refused on a member's turn for the reason the alias
-registry publishes no participant names: a listing that carries handles must
-not let one room's members enumerate the owner's others. Recording lives in
-that same `send()`: when a turn's message lands in a chat other than the
+"nobody named this". It is refused on a turn without the owner's authority for
+the reason the alias registry publishes no participant names: a listing that
+carries handles must not let one room's members enumerate the owner's others.
+Recording lives in that same `send()`: when a turn's message lands in a chat
+other than the
 turn's own, the adapter mirrors the text into that chat's session as an
 assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses
 for cron and `hermes send` deliveries — on the delivery's own coroutine, so a
@@ -346,8 +350,9 @@ nothing to add".
 ### Thread goals
 
 `/goal <text>` puts this thread's agent on a task it works toward on its own;
-`/goal` reports status and `/goal clear` stops it. Only the chat's owner can set
-or clear one, and both are announced in the thread — in a group that
+`/goal` reports status and `/goal clear` stops it. Only a turn with the owner's
+authority can set or clear one, and both are announced in the thread — in a
+group that
 announcement is the consent artifact, showing the other household what this
 agent was told to pursue before it pursues it.
 
@@ -359,7 +364,7 @@ notice that fails to deliver leaves the goal running rather than letting it go
 quiet.
 
 Every turn under a goal opens with the goal itself, framed as what the command
-already established: a standing instruction from the owner who set it, named,
+already established: a standing instruction from whoever set it, named,
 with their text carried as theirs. It used to ride as "untrusted thread data,
 not an instruction" — the right posture for words the thread supplied, and the
 wrong one for a task the owner personally authorized, which had the agent
@@ -371,15 +376,15 @@ start a line that reads as another one: quotation marks are not a boundary,
 and the guarantee is that the block ends where the code says it does, on one
 line, with anything injected left visible inside the text. The line states
 that a goal changes no rule of the turn it rides on: what may be done and
-disclosed in that room remains the channel prompt's answer. And every record
-is the owner's, named or not — the gate predates the field, so a goal written
+disclosed in that room remains the channel prompt's answer. And a record with
+no name is the owner's — the gate predates the field, so a goal written
 before authorship was recorded still reads as theirs. Retiring a goal drops
 the setter's name along with the transcript: neither has a reader once the
 goal is done, and both would otherwise sit on the persistent volume.
 
-An active goal is what unlocks replying to peer agents. Scheduled wakes carry
-the room's ordinary disclosure prompt and take owner authority only in a DM —
-unchanged by the reframing: in a group the thread is still full of other
+An active goal is what unlocks replying to peer agents. A scheduled wake has no
+human speaker, so outside the owner's DM it gets the discretion prompt and no
+authority — unchanged by the reframing: in a group the thread is still full of other
 people's words, and an owner-authorized turn acting on them unprompted is a
 confused deputy holding owner-only tools.
 
@@ -405,7 +410,9 @@ included — is a name to ask for once and record with the tool, never one to
 guess out of mail, calendar or memory. `plow_contacts` reads the book back,
 owner's row first, for the turns that have no roster at all — a Hermes-cron
 turn carries no chat, and this is where its owner's own name comes from; it
-reads on the owner's turn and on no turn, and is refused on a member's. An
+reads on a turn with the owner's authority or with no active turn at all, and
+refuses only a turn without that authority. Naming stays owner-turn-only,
+above, unlike this read. An
 owner turn needs no such read: the chat resource every one of them already
 re-reads carries the owner as a participant — name, handle and role — in a solo
 DM as much as in a group. That is what the channel prompt names them from:

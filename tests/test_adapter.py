@@ -31,6 +31,16 @@ PLUGIN = pathlib.Path(__file__).resolve().parents[1] / "plow-chat-platform" / "_
 SIGNUP = {"name": "Life Assistant", "phrase": "Set this up for me: aiworthusing.com/agent-index/life"}
 NUMBER = "+16505550100"
 
+# The four turn shapes every action gate is keyed on, plus no turn at all
+# (a cron run), as `_authority` derives them -- see the prompt matrix. The
+# trusted-group member is the one shape where `owner` and `authority` diverge;
+# the owner in a discretion group, where `authority` and recall diverge.
+_OWNER_DM = {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "recall_everywhere": True}
+_OWNER_GROUP = {"chat_uid": "cht_g", "owner": True, "dm": False, "authority": True, "recall_everywhere": False}
+_TRUSTED_MEMBER = {"chat_uid": "cht_t", "owner": False, "dm": False, "authority": True, "recall_everywhere": True}
+_DISCRETION_MEMBER = {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False,
+                      "recall_everywhere": False}
+
 
 @dataclass
 class _SendResult:
@@ -360,6 +370,11 @@ def _owned(module: Any, prompt: str, chat: dict[str, Any]) -> str:
     roster the turn reads. What that sentence SAYS is pinned once, by the
     owner-turn test below; the matrix tests only own where it sits."""
     return f"{prompt} {module._owner_fact(module._owner_identity(chat))}"
+
+
+def _membered(module: Any, prompt: str) -> str:
+    """The same, for the guard every turn but the owner's opens with."""
+    return f"{module._MEMBER_TURN_PREAMBLE}{prompt}"
 
 
 def _envelope(
@@ -1259,13 +1274,13 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     # boundary, not the asker.
     owner_prompt = handled[1]["channel_prompt"]
     assert owner_prompt == _rendered(module,
-        _voiced(module, _owned(module, module.GROUP_OWNER_CHANNEL_PROMPT, room)),
+        _voiced(module, _owned(module, module.GROUP_AUTHORITY_CHANNEL_PROMPT, room)),
         None, adapter._identity)
-    for block in (module._DISCLOSURE, module._NO_RELAY):
+    for block in (module._AUTHORITY, module._NO_RELAY):
         assert block in owner_prompt
     member_prompt = handled[2]["channel_prompt"]
     assert member_prompt == _rendered(module,
-        _voiced(module, module.EXTERNAL_CHANNEL_PROMPT), None, adapter._identity)
+        _voiced(module, _membered(module, module.EXTERNAL_CHANNEL_PROMPT)), None, adapter._identity)
     for block in (module._SPEAKER_FACT, module._DISCLOSURE, module._NO_RELAY):
         assert block in member_prompt
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
@@ -1378,7 +1393,7 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
     ("group", "role", "base"),
     [
         pytest.param(False, "owner", "OWNER_CHANNEL_PROMPT", id="dm_owner"),
-        pytest.param(True, "owner", "GROUP_OWNER_CHANNEL_PROMPT", id="group_owner"),
+        pytest.param(True, "owner", "GROUP_AUTHORITY_CHANNEL_PROMPT", id="group_owner"),
         pytest.param(True, "member", "EXTERNAL_CHANNEL_PROMPT", id="group_member"),
     ],
 )
@@ -1410,6 +1425,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
     if role == "owner":
         expected = _owned(module, expected, chat)
     else:
+        expected = _membered(module, expected)
         identity = {**identity, "signup": None}
     if group:
         expected = _voiced(module, expected)
@@ -1502,7 +1518,7 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
     await _settle(adapter)
 
     (event,) = handled
-    base = module.GROUP_OWNER_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
+    base = module.GROUP_AUTHORITY_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
     roster_facts = f"{module._RELATIONSHIP_FACT} {module._NAME_FACT} " if group else ""
     # Composed through _with_identity rather than re-spelling the prefix: the
     # identity-and-facts text is pinned once, by the prefix test above. What
@@ -1514,50 +1530,57 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
 
 
 @pytest.mark.parametrize(
-    ("group", "role", "trusted", "prompt_name"),
+    ("group", "role", "trusted", "prompt_name", "authority", "everywhere"),
     [
-        pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", id="direct-owner"),
-        pytest.param(True, "owner", False, "GROUP_OWNER_CHANNEL_PROMPT", id="untrusted-group-owner"),
-        pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", id="untrusted-group-member"),
-        pytest.param(True, "owner", True, "TRUSTED_GROUP_OWNER_CHANNEL_PROMPT", id="trusted-group-owner"),
-        pytest.param(True, "member", True, "TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT", id="trusted-group-member"),
+        pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", True, True, id="direct-owner"),
+        pytest.param(True, "owner", False, "GROUP_AUTHORITY_CHANNEL_PROMPT", True, False,
+                     id="untrusted-group-owner"),
+        pytest.param(True, "owner", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", True, True, id="trusted-group-owner"),
+        pytest.param(True, "member", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", True, True, id="trusted-group-member"),
+        pytest.param(True, "peer", True, "EXTERNAL_CHANNEL_PROMPT", False, True, id="trusted-group-peer-agent"),
+        pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", False, False, id="untrusted-group-member"),
+        pytest.param(False, "member", True, "EXTERNAL_CHANNEL_PROMPT", False, False, id="member-dm-flagged-trusted"),
     ],
 )
-async def test_trust_selects_the_explicit_prompt_matrix(
+async def test_authority_selects_the_prompt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     group: bool,
     role: str,
     trusted: bool,
     prompt_name: str,
+    authority: bool,
+    everywhere: bool,
 ) -> None:
+    """Authority is the owner's anywhere and a human's in a trusted group --
+    never a peer agent's. Recall reaches every chat only where every human
+    reading holds it: the owner's DM, or a trusted group."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     chat = _chat("cht_a", group=group, trusted=trusted)
-    adapter._set_reach([chat])
+    adapter._set_reach([chat, _chat("cht_other")])
     _mark_anchored(adapter, "cht_a")
     handled = _capture_events(monkeypatch, adapter)
 
-    await adapter._on_frame(_envelope("evt_matrix", "cht_a", "msg_matrix", role=role), object())
+    frame = (_peer_envelope("evt_matrix", "cht_a", "msg_matrix") if role == "peer"
+             else _envelope("evt_matrix", "cht_a", "msg_matrix", role=role))
+    await adapter._on_frame(frame, object())
     await _settle(adapter)
 
     expected = getattr(module, prompt_name)
-    if role == "owner":
-        expected = _owned(module, expected, chat)
+    expected = _owned(module, expected, chat) if role == "owner" else _membered(module, expected)
     if group:
         expected = _voiced(module, expected)
-    assert handled[0]["channel_prompt"] == _rendered(module, expected, None, adapter._identity)
-    # The ordering rule closes every one of these, separated from the sentence
-    # before it -- membership alone would pass on "...truthful.Write your".
-    assert f" {module._ANSWER_LAST}" in handled[0]["channel_prompt"]
-
-    if trusted:
-        prompt = handled[0]["channel_prompt"].lower()
-        assert "calendar" in prompt
-        assert "normal tools" in prompt
-        assert "everyone" in prompt
-        for secret in ("credentials", "authentication secrets", "raw tokens", "payment-card"):
-            assert secret in prompt
+    # A peer that did not name us, with no goal set, is also told to stay out.
+    silenced = module._GOAL_PEER_SILENCE if role == "peer" else ""
+    (event,) = handled
+    # Byte-for-byte equality already pins _ANSWER_LAST's trailing position and
+    # _SHARING_RULE's presence -- both are baked into `expected`.
+    assert event["channel_prompt"] == silenced + _rendered(module, expected, None, adapter._identity)
+    assert (event.authority, event.recall_everywhere) == (authority, everywhere)
+    await adapter.on_processing_start(event)
+    assert (adapter._send_guard("cht_other") is None) is authority, "the turn's gates follow its authority"
+    await adapter.on_processing_complete(event, None)
 
 
 # What an owner turn is told about its own owner. Both name the OWNER, whose
@@ -1787,8 +1810,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # _RELATIONSHIP_FACT is composed in by _collaboration_prompt (same gate as
     # _VOICE_RULE), not baked into the base prompt constants -- assert the
     # composed prompt a real turn actually gets.
-    for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
-                 module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
+    for base in (module.GROUP_AUTHORITY_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT):
         composed = module._collaboration_prompt(base, chat, identity)
         assert module._RELATIONSHIP_FACT in composed
         # A bare handle is a hole in the same roster, so the instruction to
@@ -1828,7 +1850,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     handled = _capture_events(monkeypatch, adapter)
 
     await adapter._deliver(
-        [SimpleNamespace(uid="msg_refresh", sender={"uid": "mem_member", "role": "member", "display_name": "Daniel"}, starts_slash_command=False, reply_to=None)],
+        [SimpleNamespace(uid="msg_refresh", sender={"type": "member", "uid": "mem_member", "role": "member", "display_name": "Daniel"}, starts_slash_command=False, reply_to=None)],
         [([], [], "what is on the calendar?")],
         "cht_a",
     )
@@ -1836,7 +1858,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
     assert handled[0]["channel_prompt"] == _rendered(module,
-        _voiced(module, module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT), None, adapter._identity)
+        _voiced(module, _membered(module, module.GROUP_AUTHORITY_CHANNEL_PROMPT)), None, adapter._identity)
 
 
 async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
@@ -1855,7 +1877,7 @@ async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
 
     with pytest.raises(RuntimeError, match="HTTP 503"):
         await adapter._deliver(
-            [SimpleNamespace(uid="msg_failed", sender={"uid": "mem_owner", "role": "owner", "display_name": "Sam"}, starts_slash_command=False, reply_to=None)],
+            [SimpleNamespace(uid="msg_failed", sender={"type": "member", "uid": "mem_owner", "role": "owner", "display_name": "Sam"}, starts_slash_command=False, reply_to=None)],
             [([], [], "calendar")],
             "cht_a",
         )
@@ -2195,6 +2217,90 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     ]
 
 
+def _authority_case_cross_chat_send(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """Only a turn without the owner's authority is confined to its own chat."""
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_other")])  # cht_a: the home chat must be granted
+    adapter._active_turn.set(turn)
+    result = adapter._send_guard("cht_other")
+    if authorized:
+        assert result is None
+    else:
+        assert result is not None
+        assert "authority" in result.error and "confined" in result.error
+
+
+def _authority_case_name_a_contact(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    record: list[Any] = []
+    _live_tool(module, monkeypatch, "name_contact",
+               result={"display_name": "Abby", "relationship": "wife"}, record=record)
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_name_contact(
+        {"handle": "+15550000002", "display_name": "Abby", "relationship": "wife"}))
+    assert out["success"] is authorized
+    if authorized:
+        # No chat id rides along: the contact book is keyed by handle, not by room.
+        assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
+    else:
+        assert "owner" in out["error"]
+        assert record == []
+
+
+def _authority_case_read_the_book(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """The mirror of naming's gate: a no-turn cron caller reads, where it refuses to write."""
+    record: list[Any] = []
+    _live_tool(module, monkeypatch, "contacts", result=_BOOK, record=record)
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_contacts({}))
+    assert out["success"] is authorized
+    assert out.get("contacts") == (_BOOK if authorized else None)
+    assert record == ([()] if authorized else []), "a refusal must not reach Plow at all"
+
+
+def _authority_case_list_chats(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """A listing carrying participants is the mirror of plow_contacts' gate."""
+    record: list[Any] = []
+    listing = [{"chat_id": "cht_a", "kind": "dm", "trusted": False, "participants": []}]
+    _live_tool(module, monkeypatch, "list_chats", result=listing, record=record)
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_list_chats({}))
+    assert out["success"] is authorized
+    assert out.get("chats") == (listing if authorized else None)
+    assert record == ([()] if authorized else []), "a refusal must not reach Plow at all"
+    # Somebody else's words carry the same untrusted marker every such block does.
+    assert (module._UNTRUSTED_MARK in out.get("note", "")) is authorized
+
+
+# One table over the turns every action gate is keyed on: the turn flag it
+# reads, and whether no turn at all passes. Naming is the one write, so it
+# keys on the owner's identity and, unlike the three reads, refuses no-turn.
+_GATES = {
+    "cross-chat-send": (_authority_case_cross_chat_send, "authority", True),
+    "name-a-contact": (_authority_case_name_a_contact, "owner", False),
+    "read-the-book": (_authority_case_read_the_book, "authority", True),
+    "list-chats": (_authority_case_list_chats, "authority", True),
+}
+
+
+@pytest.mark.parametrize("gate", list(_GATES))
+@pytest.mark.parametrize(
+    "turn",
+    [
+        pytest.param(_OWNER_DM, id="owner-dm"),
+        pytest.param(_OWNER_GROUP, id="owner-group"),
+        pytest.param(_TRUSTED_MEMBER, id="trusted-member"),
+        pytest.param(_DISCRETION_MEMBER, id="discretion-member"),
+        pytest.param(None, id="no-turn"),
+    ],
+)
+def test_action_gates_key_on_the_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, gate: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    run, flag, no_turn_authorized = _GATES[gate]
+    run(module, monkeypatch, turn, no_turn_authorized if turn is None else turn[flag])
+
+
 @pytest.mark.parametrize(
     ("method", "fail_at", "status"),
     [
@@ -2277,10 +2383,10 @@ def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypa
     """The three canonical group rules ride every external turn: the room-scoped
     disclosure boundary, the no-relay fact, and who owns this agent."""
     module = _load(monkeypatch, tmp_path)
-    prompt = module._channel_prompt({"type": "group", "trusted": False}, "member", _chat("cht_a", group=True), {})
+    prompt = module._channel_prompt({"type": "group"}, "member", _chat("cht_a", group=True), {}, False)
     for rule in (module._DISCLOSURE, module._NO_RELAY, module._SPEAKER_FACT):
         assert rule in prompt
-    assert module._TRUSTED_CONVERSATION not in prompt
+    assert module._AUTHORITY not in prompt
 
 
 def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -2488,41 +2594,6 @@ def _live_tool(
     return adapter
 
 
-def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A member saying "I'm Sam's wife" cannot become a label: while their turn
-    is open the tool cannot write, and neither can a call outside any active
-    turn -- the gate fails closed, like plow_start_group_message's trusted
-    branch, not open. The owner saying it, on the owner's own turn, can."""
-    module = _load(monkeypatch, tmp_path)
-    record: list[Any] = []
-    _live_tool(
-        module, monkeypatch, "name_contact",
-        result=lambda handle, body: {
-            "handle": handle, "display_name": body.get("display_name"),
-            "relationship": body.get("relationship"),
-        },
-        record=record,
-    )
-    args = {"handle": "+15550000002", "display_name": "Abby", "relationship": "wife"}
-
-    outside = json.loads(module._plow_name_contact(dict(args)))
-    assert outside["success"] is False and "owner" in outside["error"]
-    assert record == []
-
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
-    refused = json.loads(module._plow_name_contact(dict(args)))
-    assert refused["success"] is False and "owner" in refused["error"]
-    assert record == []
-
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
-    out = json.loads(module._plow_name_contact(dict(args)))
-    assert out["success"] is True
-    # No chat id rides along: the contact book is keyed by handle, not by room.
-    assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
-
-
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
@@ -2540,7 +2611,7 @@ def test_naming_reports_unconfirmed_write_on_network_error(
     module = _load(monkeypatch, tmp_path)
     raises = TimeoutError("no response") if status is None else module._PlowSendError(status, "detail")
     _live_tool(module, monkeypatch, "name_contact", raises=raises)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
 
     out = json.loads(module._plow_name_contact(
         {"handle": "+15550000002", "display_name": "Abby"}))
@@ -2552,37 +2623,6 @@ def test_naming_reports_unconfirmed_write_on_network_error(
 # The contact book as the server serves it: the owner's own row first.
 _BOOK = [{"provider_key": "+15550000001", "display_name": "Sam", "relationship": None, "role": "owner"},
          {"provider_key": "+15550000002", "display_name": "Abby", "relationship": "wife", "role": "member"}]
-
-
-@pytest.mark.parametrize(
-    ("turn", "read"),
-    [
-        pytest.param({"chat_uid": "cht_a", "owner": True}, True, id="owner-turn"),
-        pytest.param(None, True, id="a-cron-turn-has-no-turn-at-all"),
-        pytest.param({"chat_uid": "cht_a", "owner": False}, False, id="member-turn-refused"),
-    ],
-)
-def test_the_contact_book_reads_on_the_owners_turn_and_on_no_turn_but_never_a_members(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, read: bool,
-) -> None:
-    """The mirror of naming's gate, not a copy of it. A cron turn carries no
-    roster and no turn, and is exactly the caller that needs the book to know
-    its owner's name -- so no-turn reads, where no-turn refuses to write. A
-    member's own open turn is the one context somebody else is steering, and
-    it is refused, with no request made at all."""
-    module = _load(monkeypatch, tmp_path)
-    record: list[Any] = []
-    _live_tool(module, monkeypatch, "contacts", result=_BOOK, record=record)
-    module._ACTIVE_TURN.set(turn)
-
-    out = json.loads(module._plow_contacts({}))
-
-    assert out["success"] is read
-    # Rows reach the model as the server wrote them -- the owner's own row is
-    # what a rosterless turn is here for.
-    assert out.get("contacts") == (_BOOK if read else None)
-    assert record == ([()] if read else []), "a refusal must not reach Plow at all"
 
 
 @pytest.mark.parametrize("title", ["Cabin Cleaning", "+15550000001"])
@@ -2671,40 +2711,6 @@ async def test_a_declined_chat_listing_reaches_the_tool_as_a_decline(
 
 
 @pytest.mark.parametrize(
-    ("turn", "listed"),
-    [
-        pytest.param({"chat_uid": "cht_a", "owner": True}, True, id="owner-turn"),
-        pytest.param(None, True, id="a-cron-turn-has-no-turn-at-all"),
-        pytest.param({"chat_uid": "cht_a", "owner": False}, False, id="member-turn-refused"),
-    ],
-)
-def test_the_chat_listing_is_refused_on_a_members_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, listed: bool,
-) -> None:
-    """A listing carrying participants is exactly what one room's member must
-    not be able to read about the owner's other rooms -- the same line
-    plow_contacts and a cross-chat send already hold. The gate is the contact
-    book's, not naming's: a turn-less caller (cron) is the owner's own agent
-    with nobody steering it, and reads. A refusal makes no request at all."""
-    module = _load(monkeypatch, tmp_path)
-    record: list[Any] = []
-    listing = [{"chat_id": "cht_a", "kind": "dm", "trusted": False, "participants": []}]
-    _live_tool(module, monkeypatch, "list_chats", result=listing, record=record)
-    module._ACTIVE_TURN.set(turn)
-
-    out = json.loads(module._plow_list_chats({}))
-
-    assert out["success"] is listed
-    assert out.get("chats") == (listing if listed else None)
-    assert record == ([()] if listed else []), "a refusal must not reach Plow at all"
-    # Titles and names in the listing are written by the people in those
-    # rooms, and they reach a turn that can act cross-chat -- so they ride
-    # with the same marker every other block of somebody else's words carries.
-    assert (module._UNTRUSTED_MARK in out.get("note", "")) is listed
-
-
-@pytest.mark.parametrize(
     ("status", "declines"),
     [
         pytest.param(200, False, id="rows-as-the-server-wrote-them"),
@@ -2756,6 +2762,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "chat_uid": "cht_b",
         "owner": False,
         "dm": False,
+        "authority": False,
         "recall_everywhere": False,
         "no_reply_ok": False,
         "suppress_reply": False,
@@ -2870,7 +2877,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "recall_everywhere": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False, "recall_everywhere": False,
              "no_reply_ok": False, "suppress_reply": False, "recall_text": None,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
@@ -2927,6 +2934,8 @@ async def test_active_turn_retains_only_server_invite_identity(
             user_name="attacker-controlled identity",
         ),
         text="attacker-controlled praise must not cross chats",
+        authority=False,
+        recall_everywhere=False,
     )
 
     await adapter.on_processing_start(event)
@@ -3410,7 +3419,7 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
     """bool("false") is True, and a model emits that string for a declared bool.
     Explicit confirmation is required even on an authorized owner turn."""
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
@@ -3423,7 +3432,7 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, dry_run: Any
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     sent: list[tuple[str, str]] = []
     _live_tool(
         module,
@@ -3520,17 +3529,6 @@ def test_draft_by_id_send_is_blocked_everywhere(
     assert "gmail send" in out["message"]
 
 
-def test_owner_send_escalates_to_the_human_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
-    assert out["action"] == "approve"
-    assert "andrew@example.com" in out["message"]
-    assert out["rule_key"].startswith("google-send:")
-
-
 @pytest.mark.parametrize("flags", [
     ["--account", "so@plow.co"], ["-a", "so@plow.co"],
     ["--account=so@plow.co"], ["-a=so@plow.co"], ["-aso@plow.co"],
@@ -3541,7 +3539,7 @@ def test_leading_global_flags_reach_mail_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, flags: list[str],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     argv = ["plow-gog", *flags, *_SEND_ARGV[1:-2]]
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
     assert out["action"] == "approve"
@@ -3571,7 +3569,7 @@ def test_group_word_flag_value_cannot_hide_member_send(
 ) -> None:
     """Flag values cannot choose the action path; repeated flags are last-wins."""
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_group", "owner": False, "dm": False})
+    module._ACTIVE_TURN.set(_DISCRETION_MEMBER)
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
     assert out is not None
     assert out["action"] == "block"
@@ -3581,31 +3579,12 @@ def test_rule_key_is_per_message_so_always_never_generalises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     first = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
     second = module._pre_tool_call(
         "mcp__latch__plow_run_command", {"argv": _SEND_ARGV[:-4] + ["--body", "different"]},
     )
     assert first["rule_key"] != second["rule_key"]
-
-
-@pytest.mark.parametrize("turn", [
-    None,
-    {"chat_uid": "cht_b", "owner": False},
-    {"chat_uid": "cht_g", "owner": True, "dm": False},
-])
-def test_send_outside_the_owner_dm_is_blocked_not_escalated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
-) -> None:
-    """A group member must not be able to answer the approval prompt, and the
-    prompt itself would publish the email into the room; cron runs have no
-    turn at all."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set(turn)
-    argv = ["plow-gog", "--account", "so@plow.co", *_SEND_ARGV[1:-2]]
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
-    assert out["action"] == "block"
-    assert "nothing was sent" in out["message"]
 
 
 _FORCED_BOOKING_ARGV = [
@@ -3625,28 +3604,32 @@ _FORCED_BOOKING_LEADING_ACCOUNT_ARGV = [
 ]
 
 
-@pytest.mark.parametrize("argv", [_FORCED_BOOKING_ARGV,
-                                  _FORCED_BOOKING_LEADING_ACCOUNT_ARGV])
-@pytest.mark.parametrize(("turn", "expected"), [
-    ({"chat_uid": "cht_a", "owner": True, "dm": True}, None),
-    ({"chat_uid": "cht_g", "owner": True, "dm": False}, "block"),
-    ({"chat_uid": "cht_b", "owner": False}, "block"),
-    (None, "block"),
+@pytest.mark.parametrize(("argv", "allowed"), [(_SEND_ARGV, "approve"), (_FORCED_BOOKING_ARGV, None),
+                                               (_FORCED_BOOKING_LEADING_ACCOUNT_ARGV, None)],
+                         ids=["mail-send", "override", "override-leading-account"])
+@pytest.mark.parametrize(("turn", "authorized"), [
+    (_OWNER_DM, True),
+    (_OWNER_GROUP, True),
+    (_TRUSTED_MEMBER, True),
+    (_DISCRETION_MEMBER, False),
+    (None, False),
 ])
-def test_conflict_override_requires_owner_dm(
+def test_mail_sends_and_conflict_overrides_require_authority(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    argv: list[str], turn: Any, expected: str | None,
+    argv: list[str], allowed: str | None, turn: Any, authorized: bool,
 ) -> None:
-    """In the owner's own chat the hook stands aside: they fixed the time in a
-    chat it cannot read, so asking again puts the question to somebody who has
-    already answered it. Everywhere else the override is refused -- a member of
-    a group cannot have fixed the owner's time, and a cron run with no turn at
-    all has no owner behind it either."""
+    """Wherever the turn carries the owner's authority, a mail send goes in
+    front of the human gate and the hook stands aside for an override: they
+    fixed the time in a chat it cannot read, so asking again puts the question
+    to somebody who has already answered it. Everywhere else both are blocked
+    outright -- a turn without that authority cannot have fixed the owner's
+    time, and a cron run with no turn at all has no owner behind it either."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
-    assert (None if out is None else out["action"]) == expected
-
+    assert (None if out is None else out["action"]) == (allowed if authorized else "block")
+    if not authorized:
+        assert "nothing was sent" in out["message"]
 
 
 @pytest.mark.parametrize("tool_name,args", [
@@ -3665,7 +3648,7 @@ def test_other_tools_and_non_sends_pass_untouched(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tool_name: str, args: Any,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     assert module._pre_tool_call(tool_name, args) is None
 
 
@@ -3688,7 +3671,7 @@ def test_group_message_reports_adoption_separately_from_delivery(
         },
         record=sent,
     )
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
          "dry_run": False, "confirm": True, "trusted": True}))
@@ -3700,43 +3683,47 @@ def test_group_message_reports_adoption_separately_from_delivery(
 
 
 @pytest.mark.parametrize(
-    "turn",
+    ("trusted", "turn", "started", "resolved"),
     [
-        pytest.param(None, id="outside-turn"),
-        pytest.param({"chat_uid": "cht_a", "owner": False}, id="member-turn"),
+        pytest.param(True, None, False, True, id="trusted-outside-turn"),
+        pytest.param(True, _DISCRETION_MEMBER, False, True, id="trusted-discretion-member"),
+        pytest.param(True, _TRUSTED_MEMBER, False, True, id="trusted-trusted-member"),
+        pytest.param(False, _TRUSTED_MEMBER, True, False, id="plain-trusted-member"),
+        pytest.param(False, _DISCRETION_MEMBER, False, False, id="plain-discretion-member"),
+        pytest.param(False, None, False, False, id="plain-outside-turn"),
+        pytest.param("tru", _OWNER_DM, True, False, id="owner-unparseable-word-opts-out"),
+        pytest.param("maybe", _OWNER_DM, True, False, id="owner-unparseable-guess-opts-out"),
+        pytest.param("false", _OWNER_DM, True, False, id="owner-falsy-string-opts-out"),
+        pytest.param(None, _OWNER_DM, True, True, id="owner-omitted-defaults-to-full-trust"),
+        pytest.param(None, _TRUSTED_MEMBER, False, True, id="trusted-member-omitted-still-owner-only"),
     ],
 )
-@pytest.mark.parametrize("trusted", [False, True])
-def test_only_an_owner_turn_can_start_a_thread(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, trusted: bool
+def test_starting_a_thread_gates_on_trust_and_turn_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any, turn: dict[str, Any] | None,
+    started: bool, resolved: bool,
 ) -> None:
-    """Only the owner may send into a new or resumed room, in either mode."""
+    """A trusted thread hands its members the owner's own reach, so opening
+    one is owner-only even for a turn with authority in its own trusted
+    group -- whether `trusted` arrives explicit or, omitted, resolves to the
+    fixed full-trust default. A plain thread asks only authority: a trusted
+    group's member may open one the owner never touched; a discretion
+    member or no turn may not. A falsy or unparseable value always resolves
+    to discretion, never full trust."""
     module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
-               raises=AssertionError("must not send"))
+               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
     module._ACTIVE_TURN.set(turn)
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
          "dry_run": False, "confirm": True, "trusted": trusted}))
-    assert out["success"] is False
-    assert "owner" in out["error"] and "nothing was sent" in out["error"]
-
-
-@pytest.mark.parametrize(("trusted", "granted"), [("tru", False), ("maybe", False), ("false", False), (None, True)])
-def test_absent_trusted_grants_full_trust_and_falsy_or_unparseable_does_not(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any, granted: bool
-) -> None:
-    """Groups the owner starts default to full trust; a falsy value opts out,
-    and an unparseable one falls to the side that grants nothing."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
-    sent: list[Any] = []
-    _live_tool(module, monkeypatch, "start_group_thread",
-               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
-    json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi",
-         "dry_run": False, "confirm": True, "trusted": trusted}))
-    assert sent == [(["+15550001111"], "hi", granted)]
+    assert out["success"] is started
+    if started:
+        assert sent == [(["+15550001111"], "hi", resolved)]
+    else:
+        assert sent == []
+        assert "nothing was sent" in out["error"]
+        assert ("owner" if resolved else "authority") in out["error"]
 
 
 def test_start_group_does_not_require_a_trust_question(
@@ -3751,7 +3738,7 @@ def test_start_group_does_not_require_a_trust_question(
 
 def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     assert module._live is None
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
@@ -3856,7 +3843,7 @@ async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_conn
     `_ensure_anchor` at all and race the still-in-progress newest-vs-empty
     decision."""
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     entered, resumed = asyncio.Event(), asyncio.Event()
 
@@ -3975,7 +3962,7 @@ def test_a_malformed_create_response_surfaces_as_delivery_unknown(
     """The strict-read KeyError reaches the tool's generic handler: the POST
     may have been committed, so the answer is delivery-unknown, not retry."""
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     _live_tool(module, monkeypatch, "start_group_thread", raises=KeyError("uid"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
@@ -4029,7 +4016,7 @@ def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set(_OWNER_DM)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=module._PlowPreflightError("RuntimeError: home chat has no agent line"))
     out = json.loads(module._plow_start_group_message(
@@ -4277,7 +4264,7 @@ async def test_plow_credit_exhaustion_sends_one_plain_sentence(
     module = _load(monkeypatch, tmp_path)
     http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
-    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    adapter._active_turn.set(_OWNER_DM)
     error = prefix + 'HTTP 402: {"detail":"You\'re out of Plow credits. Top up at https://app.plow.co/dashboard to keep going."}'
     error += (
         "\n\nplow reported that billing, credits, or account entitlement is exhausted for anthropic/claude-sonnet-5."
@@ -4398,7 +4385,7 @@ async def test_quiet_withholds_the_working_out_only_where_someone_else_is_listen
     http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
     adapter._active_turn.set(
-        {"chat_uid": "cht_g", "owner": True, "dm": False, "no_reply_ok": False}
+        {"chat_uid": "cht_g", "owner": True, "dm": False, "authority": True, "no_reply_ok": False}
     )
 
     group = await adapter.send("cht_g", "the body", metadata=metadata)
@@ -4406,7 +4393,7 @@ async def test_quiet_withholds_the_working_out_only_where_someone_else_is_listen
 
     http.posts.clear()
     adapter._active_turn.set(
-        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
     )
     dm = await adapter.send("cht_a", "the body", metadata=metadata)
     assert dm.success and http.posts, "the owner's own 1:1 withholds nothing"
@@ -4436,7 +4423,7 @@ async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
     quiet = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, quiet, monkeypatch)
     adapter._active_turn.set(
-        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
     )
 
     dropped = await adapter.send("cht_a", body)
@@ -4445,7 +4432,7 @@ async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
     loud = _SettingsHTTP(_me(verbose=True))
     verbose = _verbose_adapter(module, loud, monkeypatch)
     verbose._active_turn.set(
-        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False}
     )
     delivered = await verbose.send("cht_a", body)
     assert delivered.success and loud.posts, "verbose delivers the same diagnostic"
@@ -4454,7 +4441,7 @@ async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
 @pytest.mark.parametrize(
     "chat_id,turn",
     [("cht_g", None),
-     ("cht_g", {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False})],
+     ("cht_g", {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "no_reply_ok": False})],
     ids=["no-active-turn", "cross-chat-during-a-turn"],
 )
 async def test_a_send_outside_the_turns_own_chat_is_never_withheld(
@@ -4699,7 +4686,7 @@ async def test_no_reply_sentinel_is_dropped_before_delivery(
     if sentinel_turn is not None:
         turn_chat = "cht_b" if sentinel_turn == "cross_chat" else "cht_a"
         adapter._active_turn.set(
-            {"chat_uid": turn_chat, "owner": True,
+            {"chat_uid": turn_chat, "owner": True, "authority": True,
              "no_reply_ok": bool(sentinel_turn)})
 
     result = await adapter.send("cht_a", body, metadata={"notify": True})
@@ -4722,51 +4709,39 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
                              (module.OWNER_CHANNEL_PROMPT, False)):
         event = SimpleNamespace(
             source=SimpleNamespace(chat_id="cht_a", chat_type="dm", user_id="u", role_authorized=True),
-            message_id="msg_1", channel_prompt=prompt)
+            message_id="msg_1", channel_prompt=prompt, authority=True, recall_everywhere=True)
         await adapter.on_processing_start(event)
         turn = adapter._active_turn.get()
         assert turn["no_reply_ok"] is expected
         await adapter.on_processing_complete(event, None)
 
 
-_HOME_SOLE_MEMBER_NOT_OWNER = _chat("cht_a")
-next(p for p in _HOME_SOLE_MEMBER_NOT_OWNER["participants"] if p["type"] == "member")["role"] = "member"
-_HOME_WITH_PEER_AGENT = _chat("cht_a")
-_HOME_WITH_PEER_AGENT["participants"].append({"type": "agent", "relationship": "peer"})
-
-
-@pytest.mark.parametrize(
-    ("chat_uid", "chat", "expected"),
-    [
-        ("cht_room", _chat("cht_room", group=True), False),
-        ("cht_room", _chat("cht_room", group=True, trusted=True), True),
-        ("cht_a", _chat("cht_a"), True),
-        ("cht_a", _chat("cht_a", group=True), False),
-        ("cht_a", _HOME_SOLE_MEMBER_NOT_OWNER, False),
-        ("cht_a", _HOME_WITH_PEER_AGENT, False),
-    ],
-    ids=["other-untrusted-room", "other-trusted-room", "home-owner-dm",
-         "home-configured-as-a-group", "home-sole-member-not-owner",
-         "home-with-peer-agent"],
-)
-async def test_the_active_turn_carries_one_recall_decision(
+@pytest.mark.parametrize(("chat_uid", "group", "trusted", "authority"),
+                         [("cht_b", False, False, True), ("cht_b", True, False, False),
+                          ("cht_b", True, True, False), ("cht_gone", True, True, False)],
+                         ids=["owner-dm", "discretion-group", "trusted-group", "chat-not-in-reach"])
+async def test_an_unstamped_hermes_event_opens_a_speakerless_wake_turn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    chat_uid: str, chat: dict[str, Any], expected: bool,
+    chat_uid: str, group: bool, trusted: bool, authority: bool,
 ) -> None:
-    """`recall_everywhere` is identity AND shape: a PLOW_HOME_CHANNEL that
-    names a group, or whose sole human isn't the owner, must not hand that
-    member the owner's cross-chat recall; a trusted room reaches every chat
-    on its own, home or not."""
+    """Hermes builds its own events -- process completions, `/loop` ticks,
+    resumes -- with no stamp, and swallows a raise from this hook. Such an
+    event is a wake with no human speaker, read from nothing that can raise:
+    authority and recall only in a known owner DM, a confined turn everywhere
+    else -- an unknown chat included -- and never no turn at all."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats[chat_uid] = chat
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=group, trusted=trusted), _chat("cht_other")])
     event = SimpleNamespace(
-        source=SimpleNamespace(chat_id=chat_uid, role_authorized=False, chat_type="group", user_id="cp_m"),
-        message_id="msg_1", channel_prompt="",
-    )
+        text="[process finished]", internal=True, message_id=None, channel_prompt=None,
+        source=SimpleNamespace(chat_id=chat_uid, chat_type="group" if group else "dm",
+                               role_authorized=not group, user_id="cp_m"))
     await adapter.on_processing_start(event)
-    turn = module._ACTIVE_TURN.get()
-    assert turn["recall_everywhere"] is expected
+    turn = adapter._active_turn.get()
+    assert (turn["authority"], turn["recall_everywhere"]) == (authority, authority)
+    assert (adapter._send_guard("cht_other") is None) is authority
+    _live_tool(module, monkeypatch, "list_chats", result=[], record=[])
+    assert json.loads(module._plow_list_chats({}))["success"] is authority
     await adapter.on_processing_complete(event, None)
 
 
@@ -4781,9 +4756,7 @@ def test_every_silence_instruction_names_the_sentinel(
     module = _load(monkeypatch, tmp_path)
     collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT,
-                   module.GROUP_OWNER_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT,
+                   module.GROUP_AUTHORITY_CHANNEL_PROMPT,
                    collaboration):
         assert module.NO_REPLY_SENTINEL in prompt
         assert "say nothing" not in prompt and "stay silent" not in prompt
@@ -4823,9 +4796,11 @@ def _active_goal_adapter(module: Any, monkeypatch: pytest.MonkeyPatch,
     return adapter, sent
 
 
-def _goal_chat_with_owner_speaking(module: Any) -> Any:
+def _goal_chat_with_owner_speaking(module: Any, *, trusted: bool = False) -> Any:
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_collaboration_chat()])
+    chat = _collaboration_chat()
+    chat["trusted"] = trusted
+    adapter._set_reach([chat])
     _mark_anchored(adapter, "cht_a")
     # These tests stand in for a live socket session, which is the only state in
     # which pacing may run at all.
@@ -4919,12 +4894,22 @@ def test_wake_backoff_doubles_and_caps(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert max(seconds) == module.GOAL_WAKE_MAX_SECONDS
 
 
-@pytest.mark.parametrize("role", ["owner", "member"], ids=["owner", "member"])
-async def test_only_the_owner_may_set_a_goal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, role: str,
+@pytest.mark.parametrize(
+    ("role", "trusted", "expect_set", "setter"),
+    [("owner", False, True, "Owner"),
+     ("member", False, False, None),
+     ("member", True, True, "Member")],
+    ids=["owner", "untrusted-member", "trusted-member"],
+)
+async def test_only_a_turn_with_authority_may_set_a_goal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    role: str, trusted: bool, expect_set: bool, setter: str | None,
 ) -> None:
+    """Authority, not identity, is the gate: the owner may always set the
+    thread's goal, and so may a member of a group the owner trusts -- only a
+    member with neither is refused."""
     module = _load(monkeypatch, tmp_path)
-    adapter = _goal_chat_with_owner_speaking(module)
+    adapter = _goal_chat_with_owner_speaking(module, trusted=trusted)
     handled = _capture_events(monkeypatch, adapter)
     sent = mock.AsyncMock(return_value=_SendResult(success=True))
     monkeypatch.setattr(adapter, "send", sent)
@@ -4936,13 +4921,13 @@ async def test_only_the_owner_may_set_a_goal(
     # The command is ours: it never reaches hermes' slash router.
     assert not any("/goal book the campsite" in (event["text"] or "") for event in handled)
     record = module._goal_load("cht_a")
-    if role == "owner":
+    if expect_set:
         assert record["text"] == "book the campsite"
         assert record["status"] == module.GOAL_ACTIVE
         # Who set it, off the sender the gate above already authorized: a
         # message uid answers "was this the same command?", never "whose
         # instruction is this?", and the turn line needs the latter.
-        assert record["set_by"] == "Owner"
+        assert record["set_by"] == setter
         # The announcement is the consent artifact: in a group it is how the
         # other household sees what this agent was told to pursue.
         assert "book the campsite" in sent.await_args[0][1]
@@ -5064,12 +5049,12 @@ async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
 async def test_an_active_goal_rides_every_turn_as_the_owners_standing_instruction(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
-    """`/goal` is owner-gated, so by the time a record exists the authorship
-    has been checked -- and presenting it to the model as thread data had the
-    agent disown the one task it was told to pursue. The line now says who set
-    it and that it is their instruction, while still quoting the text as
-    theirs: what the owner authorized is a task, not a licence to write this
-    agent's framing."""
+    """`/goal` is authority-gated, so by the time a record exists a turn with
+    the owner's authority has been checked -- and presenting it to the model
+    as thread data had the agent disown the one task it was told to pursue.
+    The line names the setter and says it is their instruction, while still
+    quoting the text as theirs: a trusted group's member may have set it, so
+    the name stands on its own rather than being relabeled "your owner"."""
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
     module._goal_save("cht_a", module._goal_new("book the campsite", set_by="Sam"))
@@ -5079,7 +5064,8 @@ async def test_an_active_goal_rides_every_turn_as_the_owners_standing_instructio
     await _settle(adapter)
 
     text = handled[0]["text"]
-    assert "Sam" in text, "the setter the write already verified"
+    assert 'set by "Sam" with /goal' in text, "the setter the write already verified"
+    assert "set by your owner" not in text, "a named setter is not relabeled as the owner"
     assert "not thread data" in text and "instruction" in text
     # Actionable, not privileged: what may be done and disclosed in this room
     # stays the channel prompt's answer, and the line says so itself.
@@ -5117,8 +5103,8 @@ def test_a_goal_written_before_authorship_was_recorded_still_reads_as_the_owners
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     """A goal already on disk at upgrade has no `set_by`, and its write was
-    owner-gated too -- so the honest reading of a missing field is the owner
-    with no name, not a demotion back to thread data."""
+    authority-gated too -- so the honest reading of a missing field is the
+    owner with no name, not a demotion back to thread data."""
     module = _load(monkeypatch, tmp_path)
     legacy = module._goal_new("book the campsite")
     legacy.pop("set_by")
@@ -5279,9 +5265,11 @@ async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
     await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
 
     assert handled[0]["source"]["role_authorized"] is False
-    # The room's real disclosure prompt, chosen from trust as it stands NOW,
-    # and the same identity opener a spoken turn gets -- a wake that knew what
-    # room it was in but not what it was would be half a turn.
+    # Trust as it stands NOW scopes the wake's recall; no trust gives a wake authority.
+    assert (handled[0].authority, handled[0].recall_everywhere) == (False, False)
+    # The room's real disclosure prompt, and the same identity opener a spoken
+    # turn gets -- a wake that knew what room it was in but not what it was
+    # would be half a turn.
     prompt = handled[0]["channel_prompt"]
     assert module.EXTERNAL_CHANNEL_PROMPT in prompt
     assert module.NO_REPLY_SENTINEL in prompt
@@ -5443,7 +5431,7 @@ async def test_the_agent_s_reply_is_recorded_on_its_own_turn_once_delivered(
     adapter = _goal_chat_with_owner_speaking(module)
     monkeypatch.setattr(adapter, "_post_message",
                         mock.AsyncMock(return_value=_SendResult(success=posted)))
-    turn = {"chat_uid": "cht_a", "owner": True, "no_reply_ok": False}
+    turn = {"chat_uid": "cht_a", "owner": True, "authority": True, "no_reply_ok": False}
     adapter._active_turn.set(turn)
 
     await adapter.send("cht_a", "I booked the campsite.", metadata={"notify": True})
@@ -5464,7 +5452,7 @@ async def test_a_refused_goal_announcement_starts_nothing(
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
 
     with pytest.raises(RuntimeError):
-        await adapter._goal_command("cht_a", "/goal book the campsite", "owner", None, "msg_set")
+        await adapter._goal_command("cht_a", "/goal book the campsite", True, None, "msg_set")
 
     assert module._goal_load("cht_a") is None, "no goal may exist without its disclosure"
     assert started == []
@@ -5551,7 +5539,7 @@ async def test_a_failed_goal_notice_never_strands_an_open_goal_unpaced(
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
 
     with contextlib.suppress(RuntimeError):        # `set` raises so the command is not checkpointed
-        await adapter._goal_command("cht_a", command, "owner", module._goal_load("cht_a"), "msg_cmd")
+        await adapter._goal_command("cht_a", command, True, module._goal_load("cht_a"), "msg_cmd")
 
     assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE, "nothing was written"
     assert started == ["cht_a"], "and the pacing it stopped was handed back"
@@ -5589,11 +5577,11 @@ async def test_replaying_the_message_that_set_a_goal_does_not_restart_it(
     monkeypatch.setattr(adapter, "send", sent)
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda _uid: None)
 
-    await adapter._goal_command("cht_a", "/goal book the campsite", "owner", None, "msg_set")
+    await adapter._goal_command("cht_a", "/goal book the campsite", True, None, "msg_set")
     settled = module._goal_retire(module._goal_load("cht_a"), "met")
     module._goal_save("cht_a", settled)
 
-    await adapter._goal_command("cht_a", "/goal book the campsite", "owner",
+    await adapter._goal_command("cht_a", "/goal book the campsite", True,
                                 module._goal_load("cht_a"), "msg_set")
 
     assert module._goal_load("cht_a")["status"] == "met", "finished work stays finished"
@@ -5729,22 +5717,31 @@ async def test_scheduled_wake_authority_matches_current_participants(
 
 
 @pytest.mark.parametrize(
-    ("command", "role"),
-    [("/goal", "owner"), ("/goal book it", "member"), ("/goal clear", "owner")],
+    ("command", "authority"),
+    [("/goal", True), ("/goal book it", False), ("/goal clear", True)],
     ids=["status", "denied", "nothing_to_clear"],
 )
 async def test_a_direct_goal_reply_that_does_not_land_is_not_acknowledged(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, command: str, role: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, command: str, authority: bool,
 ) -> None:
     """Checkpointing a command whose answer never arrived tells the user it was
     handled and removes the retry that would have delivered it. Someone who
     asked for status and got silence is owed the retry."""
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
-    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=False)))
+    sent = mock.AsyncMock(return_value=_SendResult(success=False))
+    monkeypatch.setattr(adapter, "send", sent)
 
     with pytest.raises(RuntimeError):
-        await adapter._goal_command("cht_a", command, role, None, "msg_cmd")
+        await adapter._goal_command("cht_a", command, authority, None, "msg_cmd")
+
+    if not authority:
+        # The denial itself is the reply that failed to land -- confirm this
+        # case actually exercised that branch, not the set path a truthy
+        # string used to fall through to.
+        assert "Only the owner" in sent.await_args[0][1]
+
+
 def _registered_prompt_sections(module: Any) -> dict[str, Any]:
     """register() the plugin against a minimal context and return the prompt
     sections it registered, by id."""
@@ -5929,12 +5926,13 @@ _SESSIONS = {"s_dm": {"chat_id": "cht_dm"}, "s_here": {"chat_id": "cht_room"}, "
 @pytest.mark.parametrize(
     ("turn", "expected_snippets"),
     [
-        ({"chat_uid": "cht_room", "owner": True, "dm": True, "recall_everywhere": True},
-         ["three possible addresses", "earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False},
-         ["earlier in this room"]),
+        ({**_OWNER_DM, "chat_uid": "cht_room"}, ["three possible addresses", "earlier in this room"]),
+        ({**_TRUSTED_MEMBER, "chat_uid": "cht_room"}, ["three possible addresses", "earlier in this room"]),
+        # Authority, but a member reads the reply: recall stays in the room.
+        ({**_OWNER_GROUP, "chat_uid": "cht_room"}, ["earlier in this room"]),
+        ({**_DISCRETION_MEMBER, "chat_uid": "cht_room"}, ["earlier in this room"]),
     ],
-    ids=["everywhere", "room-only"],
+    ids=["owner-dm", "trusted-group", "owner-in-discretion-group", "discretion-member"],
 )
 def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], expected_snippets: list[str]
@@ -5970,7 +5968,7 @@ def test_recall_caps_at_six_lines(
     ]
     db = _FakeDb(rows, {})
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "recall_everywhere": True})
+    module._ACTIVE_TURN.set({**_OWNER_DM, "chat_uid": "cht_room"})
     out = module._recall(session_id="s_here", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert out["context"].count("- [") == 6
 
@@ -5981,7 +5979,7 @@ def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb(_ROWS, _SESSIONS)
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
+    module._ACTIVE_TURN.set({**_DISCRETION_MEMBER, "chat_uid": "cht_room"})
     assert module._recall(session_id="s", user_message="hello there", platform="telegram") is None
     assert module._recall(session_id="s", user_message="x\n\n1", platform=module.PLATFORM_NAME) is None
     module._ACTIVE_TURN.set(None)
@@ -5994,7 +5992,7 @@ def test_recall_returns_none_when_nothing_matches(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_hermes_state(monkeypatch, _FakeDb([], {}))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
+    module._ACTIVE_TURN.set({**_DISCRETION_MEMBER, "chat_uid": "cht_room"})
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
@@ -6005,7 +6003,7 @@ def test_recall_lets_a_store_failure_propagate(
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
+    module._ACTIVE_TURN.set({**_DISCRETION_MEMBER, "chat_uid": "cht_room"})
     with pytest.raises(RuntimeError, match="fts locked"):
         module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert db.closed is True
@@ -6056,8 +6054,8 @@ def test_plow_send_message_sends_through_the_live_adapter(
 
 
 @pytest.mark.parametrize("turn, target, mirrored", [
-    ({"chat_uid": "cht_a", "owner": True}, "cht_b", ["cht_b"]),
-    ({"chat_uid": "cht_a", "owner": True}, "cht_a", []),
+    (_OWNER_DM, "cht_b", ["cht_b"]),
+    (_OWNER_DM, "cht_a", []),
     (None, "cht_b", []),
 ], ids=["cross-chat", "own-chat", "no-turn"])
 async def test_send_mirrors_exactly_a_turns_message_to_another_chat(
@@ -6110,7 +6108,8 @@ def test_a_member_email_turn_cannot_steer_a_send_into_a_phone_chat(
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     # Exactly what the email line's on_processing_start records for a
     # non-owner participant on a Gmail thread.
-    module._ACTIVE_TURN.set({"chat_uid": "cht_mail", "owner": False, "dm": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_mail", "owner": False, "dm": False,
+                             "authority": False, "email": True})
 
     out = json.loads(module._plow_send_message({"chat_id": "cht_b", "body": "steer"}))
 
@@ -6165,7 +6164,7 @@ def _sequence_fixture(monkeypatch, tmp_path):
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._chats['cht_a']['participants'] = [dict(type='member', role='owner', uid='owner')]
-    turn = dict(chat_uid='cht_a', owner=True, dm=True)
+    turn = dict(chat_uid='cht_a', owner=True, dm=True, authority=True)
     module._ACTIVE_TURN.set(turn)
     adapter._sequence_turns[id(turn)] = turn
     root = tmp_path / 'assets'
@@ -6451,7 +6450,7 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
     assert not adapter._sequence_turns
     posts = http.posts
     assert (await adapter.send('cht_a', 'Between turns', metadata={'notify': True})).success
-    next_turn = dict(chat_uid='cht_a', owner=True, dm=True)
+    next_turn = dict(chat_uid='cht_a', owner=True, dm=True, authority=True)
     adapter._active_turn.set(next_turn)
     adapter._sequence_turns[id(next_turn)] = next_turn
     assert (await adapter.send('cht_a', 'Next turn', metadata={'notify': True})).success
@@ -6646,7 +6645,7 @@ async def test_a_later_turn_start_does_not_strip_the_running_turn(monkeypatch, t
 
     event = SimpleNamespace(
         source=SimpleNamespace(chat_id='cht_a', role_authorized=True, chat_type='dm'),
-        channel_prompt='', message_id='', text='')
+        channel_prompt='', message_id='', text='', authority=True, recall_everywhere=True)
     await adapter.on_processing_start(event)
     second = adapter._active_turn.get()
     assert second is not first, 'the fixture should have produced a distinct second turn'
@@ -6712,7 +6711,7 @@ async def test_suppression_is_scoped_to_the_turns_own_chat(
     posted = mock.AsyncMock(return_value=_SendResult(success=True))
     monkeypatch.setattr(adapter, "_post_message", posted)
     monkeypatch.setattr(adapter, "_verbose_enabled", mock.AsyncMock(return_value=True))
-    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True,
+    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True, "authority": True,
                               "no_reply_ok": True, "suppress_reply": True})
 
     if send_kind == "attachment":

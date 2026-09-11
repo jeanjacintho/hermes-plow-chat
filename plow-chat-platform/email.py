@@ -198,11 +198,12 @@ class PlowEmailAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=data.get("uid"))
 
     async def on_processing_start(self, event):
-        # `dm` is False on purpose -- the Latch mail gate approves a plow-gog
-        # send only in the owner's own DM, and a reply here goes out from this
-        # line, never their Gmail.
-        _ACTIVE_TURN.set({"chat_uid": event.source.chat_id,
-                          "owner": bool(event.source.role_authorized), "dm": False})
+        # An email turn has no room to trust, so its authority is the owner's
+        # alone; `email` keeps the Latch mail gate shut -- a reply here goes out
+        # from this line, never their Gmail.
+        owner = bool(event.source.role_authorized)
+        _ACTIVE_TURN.set({"chat_uid": event.source.chat_id, "owner": owner,
+                          "dm": False, "authority": owner, "email": True})
 
     async def on_processing_complete(self, event, outcome):
         _ACTIVE_TURN.set(None)
