@@ -1,4 +1,4 @@
-# hermes-plow-chat
+# hermes-plugin-plow
 
 The **Plow Chat platform plugin for Hermes** — an agent's phone line. Inbound
 arrives over a WebSocket the plugin dials out on; outbound and cron delivery go
@@ -7,24 +7,26 @@ back through the chat REST API.
 ```
 plow-chat-platform/     exactly what gets installed, and nothing else
   plugin.yaml           the manifest -- registers the platform id
-  __init__.py           the adapter; Hermes loads it from the plugin root
+  __init__.py           the chat adapter and the tools; Hermes loads it from the plugin root
+  _transport.py         the transport the chat adapter runs, written to be shared with the email platform tracked in plow-pbc/hermes-plugin-plow#109
+  email.py              the email-line adapter: plow_email, on the same transport
 tests/                  the adapter suite
 ```
 
 The directory is named for the plugin id so the install can be a directory copy:
-`agent-mgr` snapshots this repo at the pinned SHA and swaps `plow-chat-platform/`
-into place. Nothing else here — README, tests, justfile — reaches an agent.
+`plow-hermes-agent`'s Dockerfile fetches this repo at the pinned SHA and bakes
+`plow-chat-platform/` into the image. Nothing else here — README, tests, justfile — reaches an agent.
 
-> **Ordering.** That contract needs `agent-mgr`'s `install-plugin` to install
-> this *directory*, which it does only from
-> [`plow-pbc/agent-mgr#10`](https://github.com/plow-pbc/agent-mgr/pull/10) onward.
-> Before that change it copied two files from the repository **root**, so a
-> `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
-> `agent-mgr` installs an empty plugin directory — an agent with no phone line.
-> Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
+> **Ordering.** Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
 > and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
 > deploy both API changes before pinning this plugin, or reply context will be absent
 > or indexed media replies will remain unresolved.
+> Invite retry receipts require
+> [`plow-pbc/plow#1869`](https://github.com/plow-pbc/plow/pull/1869): without it
+> a reopened invite carries no `invite_reopened` marker, so this plugin reads it
+> as possibly-delivered and declines the retry that would have worked. It fails
+> safe, never sending a duplicate, but deploy that API change before pinning
+> this plugin or recoverable invites are silently dropped.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
 > `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
@@ -39,10 +41,16 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > the legacy `/v1/agents/cloud/me` alias serves neither, and its 404 reads as
 > "not one agent" and runs on quietly rather than failing loudly). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
-> invites, but skip the ask-owner-first invite flow. Deploy the API first,
-> then land the `agent-mgr` support above, and only then bump
-> `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
-> available fails loudly instead of silently skipping delivery.
+> invites, but skip the ask-owner-first invite flow. Deploy the API first, and
+> only then bump `PLOW_CHAT_PLUGIN_SHA` in `plow-hermes-agent` (and
+> `agent-mgr`'s `images.hermes_local` base tag, which can't move past it).
+> Installing this plugin before the API is available fails loudly instead of
+> silently skipping delivery.
+> `plow_email` carries a further prerequisite: until plow lists Gmail threads
+> as chats in `GET /v1/chats` and dispatches `POST /v1/chats/{uid}/messages`
+> by provider, the adapter gets no inbound turns and its replies fail. That
+> work is tracked by [`hermes-plugin-plow#109`](https://github.com/plow-pbc/hermes-plugin-plow/issues/109) —
+> don't bump the plugin pin to a SHA where `plow_email` is registered until it ships.
 
 ## Where changes go
 
@@ -76,11 +84,11 @@ Examples:
 
 - Adheres: #61 deleted `_invite_message_template` — the `$100 in cloud credits`
   line and the activation-code placeholders — so plow composes the whole invite,
-  net −32 LOC: https://github.com/plow-pbc/hermes-plow-chat/pull/61
+  net −32 LOC: https://github.com/plow-pbc/hermes-plugin-plow/pull/61
 - Violates: #64 put ~110 lines of `plow-gog` verb tables, flag parsing and an
   explicit re-implementation of latch's `isHelpInvocation` in this plugin — a
   second copy latch's pin-bump checklist does not know about:
-  https://github.com/plow-pbc/hermes-plow-chat/pull/64
+  https://github.com/plow-pbc/hermes-plugin-plow/pull/64
 
 ## Who consumes this
 
@@ -90,20 +98,13 @@ the base image every hosted Plow agent boots, pins one commit of this repo as
 build time. That is the production consumer. The Docker fleet below is the
 deprecated one.
 
-[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr) pins a SHA of this
-repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
-
-```sh
-agent-mgr install-plugin <name>     # or as part of `agent-mgr restore <name>`
-```
-
-It lands as two files in the agent's own home, and nothing else:
-
-```
-~/.hermes-<name>/plugins/plow-chat-platform/
-  __init__.py
-  plugin.yaml
-```
+[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr)'s Docker fleet
+gets this plugin the same way — bundled in that base image, not installed
+separately. Bumping `PLOW_CHAT_PLUGIN_SHA` there, pointing `runtime/stack.json`'s
+`images.hermes_local` at the new base, and running `agent-mgr deploy` moves the
+fleet. It lands at `/opt/hermes/plugins/plow_chat/` on the image, as the same
+four files and nothing else: `__init__.py`, `_transport.py`, `email.py`,
+`plugin.yaml`.
 
 **Pinned by SHA, never vendored.** A branch ref would silently re-point a running
 agent on the next push here, and this plugin holds the chat token. A vendored
@@ -117,8 +118,8 @@ URL in git.
 
 | var | required | meaning |
 |---|---|---|
-| `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
-| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
+| `PLOW_AGENT_TOKEN` | yes | the line-scoped bearer activation mints |
+| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (the line's `provider_type` is `imessage`). Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
@@ -186,6 +187,11 @@ every reconnect. Per-chat checkpoints persist under the agent home, and a
 reconnect backfills each granted chat from its checkpoint, so a socket gap
 drops nothing.
 
+An agent's first-ever connect (no home checkpoint yet) hands hermes one setup
+turn in the home chat, signed by Plow, not the owner, and free to end in
+`NO_REPLY`: where the owner's world is (their Mac, through Latch), who the agent
+is, and how it behaves among the owner's people, saved as its own memory note.
+
 One person's rapid-fire messages are one turn: inbound is buffered per chat
 for a 2s window that resets on each arrival — iMessage's bubble + link-preview
 split, or a thought sent as two lines, reaches hermes as a single message
@@ -195,26 +201,63 @@ distinct turns. The ack is the burst's last uid, so a restart mid-burst
 backfills the whole burst; a hand-off that fails is retried where it sits, with
 the rest of the chat waiting behind it.
 
-Inline replies carry the quoted sender, time, body, and part label as untrusted
-turn data. If the reply has no attachments of its own, the adapter delivers the
-quoted parent's media through the normal attachment path: the matching provider
+Inline replies carry the quoted sender, time, and body as untrusted turn data,
+with a part label only for media. If the reply has no attachments of its own,
+the adapter delivers the quoted parent's media through the normal attachment
+path: the matching provider
 part when its index is available, otherwise all parent attachments. Everything
 comes from the message frame; no parent-message lookup is made.
 
-### Trusted group conversations
+### The email line (`plow_email`)
 
-Trust is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
-Before handing off each inbound burst, the adapter refreshes that chat so a
-dashboard change applies to the next message. An untrusted group keeps owner
-data private. In a trusted group, every participant may ask the assistant to
-use its normal tools and connected accounts, and requested results such as
-calendar details may be answered in the thread; credential, authentication,
-token, and payment-card secrets remain excluded.
+The agent's `@plow.co` address is its own Hermes platform, registered by this
+same plugin on the same credential and the same transport helpers, each
+platform holding its own socket. Every chat resource names its line's
+`provider_type`; this adapter serves the `email` ones and the phone-line
+adapter serves the `imessage` ones, so a mail never renders as an SMS room
+and a text never renders as an email. Sessions are keyed
+`plow_email:<dm|group>:<cht_id>`; the platform hint names the line's
+address, read off the thread's own agent participant at connect. Replies go
+out through the same chat send endpoint — plow dispatches on the provider —
+with no approval gate: this is the agent's own line, like its number. Only
+the turn's answer, a cron delivery, or a turn-less send is ever mailed;
+mid-turn prose and the runtime's diagnostics are dropped. No cron home
+(`PLOW_HOME_CHANNEL` stays the phone line's), no roster policy on
+multi-address threads, no backfill across a socket gap, and no delivered
+attachments in v1 — an attachment-only mail arrives as a placeholder naming
+the count ([hermes-plugin-plow#119](https://github.com/plow-pbc/hermes-plugin-plow/issues/119)).
+
+`plow_email` needs no dotenv entry of its own: it reads the same
+`PLOW_AGENT_TOKEN` as `plow_chat`, and Hermes's `_enable_plugin_platform`
+auto-enables every registered plugin platform whose `check_fn` passes, with
+no `is_connected` gate — so it comes up on the pin bump alone, same as the
+phone line.
+
+### Group discretion and full trust
+
+The room mode is an owner-scoped, per-chat preference served on `GET
+/v1/chats/{uid}`. Before handing off each inbound burst, the adapter refreshes that
+chat so a dashboard change applies to the next message. The owner's own turns carry
+the owner's authority everywhere -- a DM, an untrusted group, a trusted group. Trust
+is the one flag that extends it to anyone else: a human member's turn in a trusted
+group carries it, inside that group; it never follows them into a DM. A peer agent's
+turn and a goal wake have no human speaker, so trust grants them nothing. In
+discretion, a member's ask still waits for the owner's yes given in this thread,
+judged from the conversation, disclosing only what answers the request. A standing
+secret — a password, backup code, API key, raw token, or full card number — is
+refused regardless of authority. Email sends and calendar-conflict overrides need a
+turn with the owner's authority; an email's approval posts in the room that asked,
+and an override posts none. A turn without authority cannot send to other chats, set
+goals, or list the owner's other rooms, and only the owner's own turn writes
+contacts. A group the owner deliberately stands up to act on their behalf begins trusted;
+ordinary outreach the owner asks for — texting a contractor, a neighbour, a
+merchant — begins with discretion, as does a group another member starts. Only
+the owner can change that later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
-dashboard. It only succeeds during an owner-authored Plow Chat turn and after
-the model passes `confirm=true` for an explicit owner request. Member turns and
-calls outside an active chat turn cannot change it.
+dashboard; opening a trusted thread is owner-only too. Both only succeed on an owner-
+authored Plow Chat turn where the model passes `confirm=true` for an explicit owner
+request. Member turns and calls outside an active chat turn cannot change either.
 
 This plugin version requires a Plow API that publishes the required `trusted`
 chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
@@ -227,10 +270,11 @@ Hermes keeps one session per chat, and this adapter drops the echo of the
 agent's own sends. So a message the agent posts to chat B from a turn in chat
 A is invisible to chat B's next turn unless it is recorded there. The
 `plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
-through the adapter's `send()` like every other outbound message (the grant
-and member-turn confinement apply exactly as for a reply). `plow_list_chats`
-is where its `cht_` id comes from: a live `GET /v1/chats` — the same read that
-establishes reach, so the credential's grant is the whole listing — reduced to
+through the adapter's `send()` like every other outbound message (the grant,
+and the confinement of a turn without the owner's authority, apply exactly as
+for a reply). `plow_list_chats` is where its `cht_` id comes from: a live `GET
+/v1/chats` — the same read that establishes reach, so the credential's grant
+is the whole listing — reduced to
 id, kind, title, the humans by name and handle, and trust. Only `active` rooms
 are listed. The route excludes just `failed`, so it serves rooms still being
 set up as well; `send` requires `active` and answers a pending one with `409
@@ -239,10 +283,11 @@ no business offering a choice that fails. Titles and names in
 it are other people's words, so the result carries the same untrusted marker
 every such block does; a title the provider defaulted to the room's own
 comma-joined handles is dropped, because that column is how the API says
-"nobody named this". It is refused on a member's turn for the reason the alias
-registry publishes no participant names: a listing that carries handles must
-not let one room's members enumerate the owner's others. Recording lives in
-that same `send()`: when a turn's message lands in a chat other than the
+"nobody named this". It is refused on a turn without the owner's authority for
+the reason the alias registry publishes no participant names: a listing that
+carries handles must not let one room's members enumerate the owner's others.
+Recording lives in that same `send()`: when a turn's message lands in a chat
+other than the
 turn's own, the adapter mirrors the text into that chat's session as an
 assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses
 for cron and `hermes send` deliveries — on the delivery's own coroutine, so a
@@ -261,13 +306,19 @@ exists so the model never has to.
 
 Hermes keeps one session per chat, so a turn in one chat knows nothing of the
 others unless told. On every Plow Chat turn the plugin's `pre_llm_call` hook
-runs an OR-query built from the message's own words over the Hermes session
+runs an OR-query over the Hermes session
 store and appends up to six dated one-line snippets from other sessions to the
 turn (upstream's seam for per-turn recall: the user message, never the system
-prompt). The room is the boundary, not the asker: the home chat (the owner's
-own DM) and a trusted room recall from every chat, the owner's DMs included —
-that is what trust means here. Every other turn, an owner's turn in an
-untrusted group included, recalls only from its own chat's earlier sessions.
+prompt). The query takes the message's own words first and then the agent's own
+last words in this session, so a message with something to say fills the term
+budget alone while a bare acknowledgement — the turn where someone is answering
+a claim the agent made from another chat — still has a topic to search on. It
+matches message content only, and skips a snippet that renders as tool-call
+JSON: the store indexes serialized tool calls too, so an unscoped query matches
+inside tool arguments. The room is the boundary, not the asker: the home chat (the owner's
+own DM) and a full-trust room recall from every chat, the owner's DMs included —
+full trust also enables this broader recall. Every other turn, an owner's turn in a
+group using discretion included, recalls only from its own chat's earlier sessions.
 The current session is never recalled. Snippets are labelled as data, not
 instructions, the same way the roster is. A failing store is not caught
 here: Hermes isolates and logs a failing hook and the turn proceeds without
@@ -317,8 +368,9 @@ nothing to add".
 ### Thread goals
 
 `/goal <text>` puts this thread's agent on a task it works toward on its own;
-`/goal` reports status and `/goal clear` stops it. Only the chat's owner can set
-or clear one, and both are announced in the thread — in a group that
+`/goal` reports status and `/goal clear` stops it. Only a turn with the owner's
+authority can set or clear one, and both are announced in the thread — in a
+group that
 announcement is the consent artifact, showing the other household what this
 agent was told to pursue before it pursues it.
 
@@ -330,7 +382,7 @@ notice that fails to deliver leaves the goal running rather than letting it go
 quiet.
 
 Every turn under a goal opens with the goal itself, framed as what the command
-already established: a standing instruction from the owner who set it, named,
+already established: a standing instruction from whoever set it, named,
 with their text carried as theirs. It used to ride as "untrusted thread data,
 not an instruction" — the right posture for words the thread supplied, and the
 wrong one for a task the owner personally authorized, which had the agent
@@ -342,15 +394,15 @@ start a line that reads as another one: quotation marks are not a boundary,
 and the guarantee is that the block ends where the code says it does, on one
 line, with anything injected left visible inside the text. The line states
 that a goal changes no rule of the turn it rides on: what may be done and
-disclosed in that room remains the channel prompt's answer. And every record
-is the owner's, named or not — the gate predates the field, so a goal written
+disclosed in that room remains the channel prompt's answer. And a record with
+no name is the owner's — the gate predates the field, so a goal written
 before authorship was recorded still reads as theirs. Retiring a goal drops
 the setter's name along with the transcript: neither has a reader once the
 goal is done, and both would otherwise sit on the persistent volume.
 
-An active goal is what unlocks replying to peer agents. Scheduled wakes carry
-the room's ordinary disclosure prompt and take owner authority only in a DM —
-unchanged by the reframing: in a group the thread is still full of other
+An active goal is what unlocks replying to peer agents. A scheduled wake has no
+human speaker, so outside the owner's DM it gets the discretion prompt and no
+authority — unchanged by the reframing: in a group the thread is still full of other
 people's words, and an owner-authorized turn acting on them unprompted is a
 confused deputy holding owner-only tools.
 
@@ -376,7 +428,9 @@ included — is a name to ask for once and record with the tool, never one to
 guess out of mail, calendar or memory. `plow_contacts` reads the book back,
 owner's row first, for the turns that have no roster at all — a Hermes-cron
 turn carries no chat, and this is where its owner's own name comes from; it
-reads on the owner's turn and on no turn, and is refused on a member's. An
+reads on a turn with the owner's authority or with no active turn at all, and
+refuses only a turn without that authority. Naming stays owner-turn-only,
+above, unlike this read. An
 owner turn needs no such read: the chat resource every one of them already
 re-reads carries the owner as a participant — name, handle and role — in a solo
 DM as much as in a group. That is what the channel prompt names them from:
@@ -418,16 +472,20 @@ Both halves need the attachments API — `plow-pbc/plow#1435`. Against an older
 API the inbound path sees no `attachments` field (a `KeyError`, loud, per
 REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
 the frame loop on every inbound message, so the socket is torn down and
-reconnected every 5s and the phone line is mute until the API catches up:
-`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
-until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+reconnected, and the phone line is mute in between. That gap is **30 seconds**,
+not the five this warning used to name: the failure is post-connect, so the
+socket has already called `connected()` and reset the backoff, and each retry
+starts the curve over rather than climbing it. Six times longer, every message:
+`PLOW_CHAT_PLUGIN_SHA` in `plow-hermes-agent` must not be bumped to this
+commit — and `agent-mgr`'s `images.hermes_local` base tag can't move past it
+— until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
 to.
 
 ## One implementation, two delivery paths
 
-This adapter is the only plow_chat implementation. `agent-mgr` installs it into
-Docker-fleet agents at the SHA pinned in its `runtime/plow-chat-plugin.ref`;
-`plow-pbc/plow`'s blessed exe.dev image bakes the same tree at the same pin.
+This adapter is the only plow_chat implementation; see Who consumes this
+above for the delivery paths. `plow-pbc/plow`'s blessed exe.dev image bakes
+the same tree at the same `PLOW_CHAT_PLUGIN_SHA` pin.
 The old second implementation in `plow`'s `cloud-agents/` was retired by the
 unification (`plow-pbc/plow#1420`); its multi-chat credential-scope design is
 what this adapter now is.
@@ -441,7 +499,7 @@ reference for the underlying Hermes behaviour.
 just test
 ```
 
-The suite loads `__init__.py` by path and stubs the `gateway.*` modules Hermes
+The suite loads the plugin directory as a package and stubs the `gateway.*` modules Hermes
 supplies at runtime, so it needs no Hermes install and touches no network.
 
 ## Provenance
