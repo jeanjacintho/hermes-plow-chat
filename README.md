@@ -125,7 +125,8 @@ URL in git.
 The persona name shown to the model is read from `GET /v1/agents/me`'s
 `agent.name` at reach refresh, not from a dotenv var — the owner sets it
 server-side (`PATCH /v1/agents/{uid}`). Falls back to the line's own
-`display_name` when unset; either way, the server-assigned line name and
+`display_name` when unset, including the API's creation default
+(`cloud agent`); either way, the server-assigned line name and
 the iMessage contact card are untouched.
 
 Diagnostics — agent status frames, 💾 background-review posts, ⏳ long-running

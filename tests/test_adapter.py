@@ -1913,6 +1913,12 @@ async def test_a_grant_that_drops_the_configured_home_is_refused(
         # forever, since refresh has no other timer to correct it.
         pytest.param(200, {"signup": SIGNUP, "number": NUMBER}, "Elm",
                      None, True, None, id="200-clears-a-removed-name"),
+        # The API's required agent.name defaults to "cloud agent" when create
+        # omits it. That is the resource name, not a persona the owner chose,
+        # so a 200 carrying it must clear the cache the same way a missing
+        # name does -- otherwise _agent_name never reaches Elm / Willow.
+        pytest.param(200, {"signup": SIGNUP, "number": NUMBER}, "Jessie",
+                     "cloud agent", True, None, id="200-creation-default-is-not-a-persona"),
     ],
 )
 async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
@@ -1934,7 +1940,9 @@ async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
     instruction-shaped value must not ride straight into the who-sentence
     `_with_identity` builds. A successful read REPLACES the whole cache even
     when the name comes back empty -- a 200 is a 200, and only a failed read
-    means "keep what we hold"."""
+    means "keep what we hold". The creation default `"cloud agent"` is empty
+    for this cache: it is the API's required resource name, not a persona,
+    so `_agent_name` can still fall through to the line display_name."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._identity = {**held, "name": held_agent_name}

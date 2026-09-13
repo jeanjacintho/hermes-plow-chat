@@ -133,9 +133,11 @@ def _agent_name(chat, override=None):
     in `_collaboration_turn_context`) the roster line. Callers pass
     `self._identity["name"]`: `agent.name` from `GET /v1/agents/me`, set by
     the owner with `PATCH /v1/agents/{uid}` and read back at reach refresh, no
-    reprovision or dotenv access needed. It does not change `line.display_name`
-    itself, and it does not reach the iMessage contact card, which the server
-    delivers directly to the phone before this plugin's gateway ever connects.
+    reprovision or dotenv access needed. The API's creation default
+    `"cloud agent"` is stored as unset, so this falls through to the line's
+    `display_name`. It does not change `line.display_name` itself, and it does
+    not reach the iMessage contact card, which the server delivers directly to
+    the phone before this plugin's gateway ever connects.
 
     With no override, read from the chat's own agent participant, so the DB
     stays the single identity source and a rename needs no reprovision — it
@@ -1313,9 +1315,13 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # into the who-sentence _with_identity builds. The whole
                     # dict is replaced, not patched -- a 200 is the answer for
                     # THIS read, so a cleared name must clear the cache too.
+                    # Creation stores the resource default "cloud agent" when
+                    # the owner omitted a name; that is not a chosen persona,
+                    # so it must not beat the line display_name (Elm, Willow).
+                    name = _one_line((me.get("agent") or {}).get("name")) or None
                     self._identity = {"signup": me.get("signup"),
                                       "number": (me.get("line") or {}).get("provider_key"),
-                                      "name": _one_line((me.get("agent") or {}).get("name")) or None}
+                                      "name": None if name == "cloud agent" else name}
                 elif resp.status != 404:
                     # 404 is the documented "this token is not one agent" -- a
                     # wildcard or multi-line grant -- and keeps what we hold.
