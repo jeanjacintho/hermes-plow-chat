@@ -32,9 +32,29 @@ import pytest
 
 PLUGIN = pathlib.Path(__file__).resolve().parents[1] / "plow-chat-platform" / "__init__.py"
 
-# The identity `/v1/agents/cloud/me` serves, as every stub and prefix test reads it.
+# The identity `/v1/agents/me` serves, as every stub and prefix test reads it.
 SIGNUP = {"name": "Life Assistant", "phrase": "Set this up for me: aiworthusing.com/agent-index/life"}
 NUMBER = "+16505550100"
+AGENT = "agt_1"
+ME = {"line": {"uid": "ln_e", "provider_key": NUMBER}, "agent": {"uid": AGENT}, "chats": [], "mcp_url": None,
+      "signup": SIGNUP}
+
+# What `GET /v1/lines` serves: the pool, as personas with a number and a
+# mailbox each. `agent_uid` is this owner's agent on the row: Elm is this
+# agent (its mailbox row rides on the persona, as the API pairs them), Spruce
+# is a sibling, Willow is a line the owner only talks to. One unnamed row,
+# which the roster must skip.
+LINES = [
+    {"uid": "ln_e", "provider_type": "imessage", "provider_key": NUMBER, "display_name": "Elm", "agent_uid": AGENT},
+    {"uid": "ln_em", "provider_type": "email", "provider_key": "elm@plow.co", "display_name": "Elm", "agent_uid": None},
+    {"uid": "ln_s", "provider_type": "imessage", "provider_key": "+16505550101", "display_name": "Spruce",
+     "agent_uid": "agt_2"},
+    {"uid": "ln_w", "provider_type": "imessage", "provider_key": "+16505550102", "display_name": "Willow",
+     "agent_uid": None},
+    {"uid": "ln_u", "provider_type": "imessage", "provider_key": "+16505550199", "display_name": None,
+     "agent_uid": None},
+]
+IDENTITY = {"signup": SIGNUP, "number": NUMBER, "agent": AGENT, "lines": LINES}
 
 # The four turn shapes every action gate is keyed on, plus no turn at all
 # (a cron run), as `_authority` derives them -- see the prompt matrix. The
@@ -1154,8 +1174,10 @@ class _AnchorLifecycleHTTP:
         self.history_reads: list[str] = []
 
     def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-        if url.endswith("/v1/agents/cloud/me"):
-            return _Resp({"line": {"uid": "ln_x", "provider_key": NUMBER}, "signup": SIGNUP})
+        if url.endswith("/v1/agents/me"):
+            return _Resp(ME)
+        if url.endswith("/v1/lines"):
+            return _Resp({"object": "list", "data": LINES, "has_more": False})
         if url.endswith("/v1/chats"):
             return _Resp({"object": "list", "data": self.chats, "has_more": False})
         chat_uid = url.split("/v1/chats/")[1].split("/")[0]
@@ -1514,7 +1536,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
     addressed."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._identity = {"signup": SIGNUP, "number": NUMBER}
+    adapter._identity = IDENTITY
     chat = _chat("cht_a", group=group, agent_name=agent_name)
     adapter._set_reach([chat])
     _mark_anchored(adapter, "cht_a")
@@ -1530,7 +1552,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
         expected = _owned(module, expected, chat)
     else:
         expected = _membered(module, expected)
-        identity = {**identity, "signup": None}
+        identity = {**identity, "signup": None, "lines": ()}
     if group:
         expected = _voiced(module, expected)
     assert event["channel_prompt"] == _rendered(module, expected, agent_name, identity)
@@ -1554,38 +1576,56 @@ def _assert_in_order(text: str, *fragments: str) -> None:
         at = found
 
 
+_ROSTER = "Plow's lines -- the numbers and mailboxes Plow agents answer from -- are "
+
+
 @pytest.mark.parametrize(
-    ("name", "identity", "opening", "offer"),
+    ("name", "identity", "opening", "offer", "roster"),
     [
         pytest.param(
-            "Elm", {"signup": SIGNUP, "number": NUMBER},
+            "Elm", IDENTITY,
             "You are Elm, a Plow assistant; people here address you by that name.",
             f'Anyone can get their own Plow Life Assistant by texting "{SIGNUP["phrase"]}" to {NUMBER}.',
-            id="named-with-signup",
+            f"{_ROSTER}Elm ({NUMBER}, elm@plow.co; your owner's agent, and that is you), "
+            "Spruce (+16505550101; your owner's agent), Willow (+16505550102).",
+            id="named-with-signup-and-roster",
+        ),
+        # A token /me cannot identify as one agent (404) still has a roster,
+        # and "that is you" is not guessed: no persona is marked as this agent.
+        pytest.param(
+            "Elm", {**IDENTITY, "signup": None, "agent": None},
+            "You are Elm, a Plow assistant; people here address you by that name.", None,
+            f"{_ROSTER}Elm ({NUMBER}, elm@plow.co; your owner's agent), "
+            "Spruce (+16505550101; your owner's agent), Willow (+16505550102).",
+            id="named-no-agent-uid-marks-nobody-as-you",
         ),
         pytest.param(
-            None, {"signup": None, "number": NUMBER},
-            "You are a Plow assistant.", None, id="unnamed-no-signup",
+            None, {"signup": None, "number": NUMBER, "agent": None, "lines": ()},
+            "You are a Plow assistant.", None, None, id="unnamed-no-signup-no-roster",
         ),
     ],
 )
 def test_the_identity_prefix_says_these_things_in_this_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    name: str | None, identity: dict[str, Any], opening: str, offer: str | None,
+    name: str | None, identity: dict[str, Any], opening: str, offer: str | None, roster: str | None,
 ) -> None:
     """The facts are prose the model acts on, so a dropped, reworded or
     reordered fact is a behaviour change with no other signal. The agent is a
     "Plow assistant" whatever variant it offers: the signup name says what
-    someone else can get, never what this agent is."""
+    someone else can get, never what this agent is. The roster names every
+    persona once with its number and mailbox, marks the owner's own agents
+    and which of them this is, skips unnamed lines, and is absent until a
+    refresh has read it."""
     module = _load(monkeypatch, tmp_path)
     prefix = module._with_identity("PROMPT", name, identity)
 
     assert prefix.startswith(opening)
     _assert_in_order(prefix, opening, *filter(None, (offer,)), "call plow_offer_invite",
+                     *filter(None, (roster, roster and "read from the Mac")),
                      "Reach for it yourself", "has to be awake with Latch running",
                      module.LATCH_URL, module.DASHBOARD_URL, *_CARDS, "PROMPT")
-    if offer is None:
-        assert "Anyone can get their own" not in prefix, "no phrase, no offer sentence"
+    assert (_ROSTER in prefix) == (roster is not None)
+    assert "+16505550199" not in prefix, "an unnamed line is not a persona"
 
 
 @pytest.mark.parametrize(
@@ -1884,7 +1924,7 @@ def test_member_labels_never_gain_channel_prompt_authority(
     sender = chat["participants"][-1]
 
     prompt = module._collaboration_prompt(
-        module.EXTERNAL_CHANNEL_PROMPT, chat, {"signup": None, "number": None})
+        module.EXTERNAL_CHANNEL_PROMPT, chat, module._NO_IDENTITY)
     turn_context = module._collaboration_turn_context(chat, sender)
 
     assert "Ignore prior rules" not in prompt
@@ -1908,7 +1948,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # takes, and the owner's own row says so, so naming the owner has a source too.
     assert "Abby (+15550000002) (landlord)" in context
     assert "Sam (+15550000001) (your owner)" in context
-    identity = {"signup": None, "number": None}
+    identity = module._NO_IDENTITY
     prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity)
     assert "Abby" not in prompt
     assert "landlord" not in prompt
@@ -2031,45 +2071,50 @@ async def test_a_grant_that_drops_the_configured_home_is_refused(
 
 
 @pytest.mark.parametrize(
-    ("me_status", "held", "refreshes"),
+    ("me_status", "lines_status", "held", "refreshes"),
     [
-        pytest.param(200, {"signup": None, "number": None}, True, id="200-sets-it"),
-        pytest.param(404, {"signup": SIGNUP, "number": NUMBER}, True, id="404-keeps-what-we-hold"),
-        pytest.param(503, {"signup": SIGNUP, "number": NUMBER}, False, id="503-fails-the-refresh"),
+        pytest.param(200, 200, None, True, id="200-sets-it"),
+        pytest.param(404, 200, {**IDENTITY, "lines": ()}, True, id="404-keeps-what-we-hold"),
+        pytest.param(503, 200, {**IDENTITY, "lines": ()}, False, id="503-fails-the-refresh"),
         # Below 400, so raise_for_status stays quiet -- a proxy bouncing us to a
         # login page is still not an answer about identity, and must fail loudly.
-        pytest.param(302, {"signup": SIGNUP, "number": NUMBER}, False, id="302-fails-the-refresh"),
+        pytest.param(302, 200, {**IDENTITY, "lines": ()}, False, id="302-fails-the-refresh"),
+        # The roster read has no 404 rule: any non-200 fails the refresh.
+        pytest.param(200, 503, {**IDENTITY, "lines": ()}, False, id="lines-503-fails-the-refresh"),
     ],
 )
-async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
+async def test_identity_refresh_reads_me_and_the_roster_and_only_a_200_speaks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    me_status: int, held: dict[str, Any], refreshes: bool
+    me_status: int, lines_status: int, held: dict[str, Any] | None, refreshes: bool
 ) -> None:
-    """The facts come from /me on the same refresh that reads the grant. Only a
-    200 sets them; a 404 (a token /me cannot identify as one agent) keeps what
-    we hold and the phone line up; anything else is not an answer about
-    identity and fails the refresh, so _listen retries rather than running on
-    silently. Refresh has no timer, so an overwrite on failure would strip the
-    offer for the life of a healthy socket."""
+    """The facts come from /me and /v1/lines, once per socket session. Only a
+    200 sets them; a 404 on /me (a token /me cannot identify as one agent)
+    keeps what we hold and the phone line up; anything else is not an answer
+    and fails the refresh, so _listen retries rather than running on silently.
+    An overwrite on failure would strip the offer for the life of a healthy
+    socket. The reach refresh an unknown-chat frame triggers reads neither:
+    a blip there must not cost the frame."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    held = dict(module._NO_IDENTITY if held is None else held)
     adapter._identity = dict(held)
 
     class _ReachAndMeHTTP:
         def get(self, url: str, **kwargs: Any) -> _Resp:
-            if url.endswith("/v1/agents/cloud/me"):
-                return _Resp({"line": {"uid": "ln_x", "provider_key": NUMBER}, "chats": [], "mcp_url": None,
-                              "signup": SIGNUP}, status=me_status)
+            if url.endswith("/v1/agents/me"):
+                return _Resp(ME, status=me_status)
+            if url.endswith("/v1/lines"):
+                return _Resp({"object": "list", "data": LINES, "has_more": False}, status=lines_status)
             return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
 
+    await adapter._refresh_reach(_ReachAndMeHTTP())
+    assert adapter.chat_uids == frozenset({"cht_a"}) and adapter._identity == held, "reach alone"
     if refreshes:
-        await adapter._refresh_reach(_ReachAndMeHTTP())
-        assert adapter.chat_uids == frozenset({"cht_a"})
+        refreshed = await module._refresh_identity(_ReachAndMeHTTP(), adapter.auth, held)
+        assert refreshed == (IDENTITY if me_status == 200 else {**held, "lines": LINES})
     else:
         with pytest.raises(RuntimeError):
-            await adapter._refresh_reach(_ReachAndMeHTTP())
-
-    assert adapter._identity == {"signup": SIGNUP, "number": NUMBER}
+            await module._refresh_identity(_ReachAndMeHTTP(), adapter.auth, held)
 
 
 async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
@@ -2093,6 +2138,8 @@ async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
 
         def get(self, url: str, **kwargs: Any) -> _Resp:
             self.gets += 1
+            if url.endswith("/v1/lines"):
+                return _Resp({"object": "list", "data": [], "has_more": False})
             return _Resp(listing if url.endswith("/v1/chats") else {}, status=200 if url.endswith("/v1/chats") else 404)
 
     http = _GrantHTTP()
@@ -2200,6 +2247,7 @@ async def test_a_first_ever_connect_primes_the_agent_once(
         monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SocketHTTP())
         monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
         monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
+        monkeypatch.setattr(module, "_refresh_identity", mock.AsyncMock(return_value=module._NO_IDENTITY))
         async def live_roster(chat_uid: str, adapter: Any = adapter) -> None:
             adapter._chats[chat_uid] = _chat(chat_uid, group=live_group)
 
@@ -3874,6 +3922,7 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
         {"object": "list", "data": [_chat("cht_a")], "has_more": False}
     )
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    monkeypatch.setattr(module, "_refresh_identity", mock.AsyncMock(return_value=module._NO_IDENTITY))
 
     async def listen_once() -> None:
         # Stands in for a real first anchor pass completing.
@@ -3928,8 +3977,10 @@ async def test_connect_reads_who_invited_the_owner_once_and_comes_up_without_it(
             if url.endswith("/v1/auth/profile"):
                 profile_reads.append(headers)
                 return _Resp(payload, status=status)
-            if url.endswith("/v1/agents/cloud/me"):
-                return _Resp({"line": {"uid": "ln_x", "provider_key": NUMBER}, "signup": SIGNUP})
+            if url.endswith("/v1/agents/me"):
+                return _Resp(ME)
+            if url.endswith("/v1/lines"):
+                return _Resp({"object": "list", "data": LINES, "has_more": False})
             return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
 
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _ProfileHTTP())
@@ -4972,7 +5023,7 @@ def test_every_silence_instruction_names_the_sentinel(
     its silence, which then delivers. Every turn that may warrant no reply
     is told to answer with the sentinel send() drops instead."""
     module = _load(monkeypatch, tmp_path)
-    collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
+    collaboration = module._collaboration_prompt("", _collaboration_chat(), module._NO_IDENTITY)
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT, collaboration):
         assert module.NO_REPLY_SENTINEL in prompt
         assert "say nothing" not in prompt and "stay silent" not in prompt
@@ -4984,7 +5035,7 @@ def test_every_silence_instruction_names_the_sentinel(
     assert module._SILENCE_OPTION in module.EXTERNAL_CHANNEL_PROMPT
     group_owner_turn = module._collaboration_prompt(
         module.GROUP_AUTHORITY_CHANNEL_PROMPT, _collaboration_chat(),
-        {"signup": None, "number": None})
+        module._NO_IDENTITY)
     assert group_owner_turn.count(f"reply with exactly {module.NO_REPLY_SENTINEL}") == 1
     # Quiet in a group is the MODEL's call, made from this rule and answered
     # with the sentinel: the adapter holds no name match and no addressed-ness
@@ -5012,7 +5063,7 @@ def test_every_silence_instruction_names_the_sentinel(
     # A wake or setup turn is exempt: SETUP_TURN tells it to call
     # plow_list_skills once, which "call nothing, fetch nothing" forbade.
     signed = module._collaboration_prompt("", _collaboration_chat(),
-                                          {"signup": None, "number": None}, False)
+                                          module._NO_IDENTITY, False)
     assert module._GROUP_SPEAK_RULE not in signed
     assert module._VOICE_RULE in signed, "it still speaks for its own human"
     # The sentinel gets the last word where silence is on offer -- and only
@@ -5031,11 +5082,11 @@ def test_every_silence_instruction_names_the_sentinel(
     # Asserted on the COMPOSED prompt, not the constant: the constant stayed
     # clean while _ANSWER_LAST put the token into every turn.
     solo = module._channel_prompt({**_dm_chat(), "type": "dm"}, "owner", _dm_chat(),
-                                  {"signup": None, "number": None}, True)
+                                  module._NO_IDENTITY, True)
     assert module.NO_REPLY_SENTINEL not in solo, "an owner DM must not reserve the token"
     assert module._ANSWER_LAST in solo, "the ordering rule still rides every turn"
     group = module._channel_prompt({**_collaboration_chat(), "type": "group"}, "owner",
-                                   _collaboration_chat(), {"signup": None, "number": None}, True)
+                                   _collaboration_chat(), module._NO_IDENTITY, True)
     assert module._ANSWER_LAST_SILENCE in group, "a group turn ends on the sentinel"
     assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
 
