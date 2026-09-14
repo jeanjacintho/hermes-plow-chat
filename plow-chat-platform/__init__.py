@@ -1588,7 +1588,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # turn's own replies are still reachable.
         turn = self._active_turn.get()
         said = list(turn.get("said") or ()) if turn else []
-        self._cancel_typing(chat_uid)
         self._active_turn.set(None)
         # This turn's ownership and this turn's tasks: a completion that
         # reached for the chat's entry instead would retire whichever turn
