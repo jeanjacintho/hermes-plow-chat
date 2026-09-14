@@ -4994,8 +4994,8 @@ def test_every_silence_instruction_names_the_sentinel(
     # wake names nobody.
     assert not [name for name in dir(module) if "stay_silent" in name], \
         "the decision is the model's, not the code's -- no predicate of any name"
-    for signal in ("your name", "follow-up", "a reply to a message of yours",
-                   "a goal for", "reply with exactly"):
+    for signal in ("it uses your name", "a reply to a message you sent",
+                   "directly continues", "a goal for", "reply with exactly"):
         assert signal in module._GROUP_SPEAK_RULE
     # Ownership is decided BEFORE any tool runs: suppression lands in send(),
     # which is after a Mac, mail or calendar side effect would already have
@@ -5005,7 +5005,8 @@ def test_every_silence_instruction_names_the_sentinel(
     # Addressing a PERSON hands the thread over too. The owner asked Spruce a
     # question, then asked Sam one; Spruce answered that too, because the rule
     # only handed the floor to another agent (his group test, 2026-09-14).
-    for handover in ("another agent, or a person by name", "is Sam's to answer"):
+    for handover in ("Silence is your default", "is Sam's to answer",
+                     "addressed to the room, not to you", "you are not addressed"):
         assert handover in module._GROUP_SPEAK_RULE
     assert collaboration.count(module._GROUP_SPEAK_RULE) == 1
     # A wake or setup turn is exempt: SETUP_TURN tells it to call
