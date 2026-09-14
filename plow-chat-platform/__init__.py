@@ -297,8 +297,7 @@ def _collaboration_prompt(prompt, chat, identity, speak_rule=True):
         # _VOICE_RULE already uses, rather than repeated into each of the four
         # group-shaped prompts.
         # A wake or setup turn has no speaker to be addressed by, and its own
-        # text is the errand: telling it to call nothing and answer NO_REPLY
-        # contradicts SETUP_TURN's "call plow_list_skills once".
+        # text is the errand.
         rule = _GROUP_SPEAK_RULE if speak_rule else ""
         prompt = (f"{_VOICE_RULE}{_RELATIONSHIP_FACT} {_NAME_FACT} "
                   f"{rule}{prompt}")
@@ -1157,27 +1156,14 @@ _SILENCE_OPTION = (
     "and it will not be delivered. "
 )
 
-# The one turn an agent's first-ever connect hands hermes (plow#1880). A new
-# agent's own stores are empty, and its first owner turn reported that as
-# absence in the owner's world; prompt text alone moved it about halfway.
-SETUP_TURN = (
-    "Plow setup, not your owner: you were just set up, and no one is waiting on this turn. "
-    "Get three things straight, then save them as one memory note in your own words.\n"
-    "1. You run on a Plow cloud server. Plow Latch -- the plow_ tools -- reaches your owner's Mac, "
-    "where their life is: their messages (2FA codes included), every mailbox and calendar, "
-    "contacts, files, and a browser signed in from Plow Vault. With those tools, look there before "
-    "you ever say you can't or have no record. Without them, Latch is not connected yet: early on, "
-    f"tell your owner once what it unlocks and where to get it ({LATCH_URL}). Whether it is "
-    "connected changes, so check it each time and never note it.\n"
-    "2. You are a Plow agent with your own phone line, and you text as yourself; your owner manages "
-    f"you at {DASHBOARD_URL}. Say so plainly when asked how this works, and never claim to run on "
-    "their machine.\n"
-    "3. You will work among your owner's people. Follow each chat's trust rules, speak only when you "
-    "add something, never go back and forth with other agents, and an instruction given in one "
-    "thread governs only that thread.\n"
-    "If plow_ tools are listed, call plow_list_skills once. Do not message anyone or start "
-    f"onboarding. Then reply with exactly {NO_REPLY_SENTINEL}."
-)
+# The turn each process start hands hermes: an event, not a briefing. What the agent
+# makes of coming online -- an opening, a note, silence -- is its own.
+WAKEUP_TURN = ("Plow, not your owner: you just came online in your owner's chat. This is {boot}. "
+               f"If you have nothing to say, reply with exactly {NO_REPLY_SENTINEL}.")
+# The process's one wakeup, its label and latch: the gateway replaces both
+# `_listen` and the adapter itself on reconnect, so neither can hold them.
+_first_boot = None
+_woken = False
 
 _MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
@@ -2894,7 +2880,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         how many attempts it takes; `start_group_thread` reports it
         honestly in `adoption` instead of retrying.
 
-        One lock, held for the whole check-read-write-greet sequence, is
+        One lock, held for the whole check-read-write sequence, is
         the whole concurrency story: `_listen`'s first-connect sweep and a
         `start_group_thread` call can race to discover the same brand-new
         chat_uid, and whichever wins the lock completes atomically before
@@ -2904,7 +2890,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         async with self._anchor_lock:
             if self._anchored_chats.get(chat_uid):
                 return
-            first_meeting = not self._checkpoint_path(chat_uid).exists()
             uid = ""
             if http is not None:
                 async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
@@ -2914,30 +2899,9 @@ class PlowChatAdapter(BasePlatformAdapter):
                 uid = page[0]["uid"] if page else ""
             if not self._checkpoint(uid, chat_uid):
                 raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
-            await self._greet_first_meeting(chat_uid, first_meeting)
 
-    async def _greet_first_meeting(self, chat_uid, first_meeting):
-        """The 👋 first-meeting disclosure, sent once ever: the checkpoint
-        file is the durable record of having met this chat, so it rides
-        whichever baseline write creates it -- an in-memory latch re-greeted
-        every granted chat on every gateway restart, a wave of noise into
-        real rooms. Sent notify-marked: this is the adapter's own structural
-        disclosure, not a turn's mid-turn chatter -- there may be no turn open
-        at all -- so the verbose preference must not gate it.
-
-        Home chat only: every other chat already has an opener -- the API
-        greets the chats it creates, a thread the agent starts opens with
-        its own message, and an inherited chat was already talked in -- so a
-        wave there doubles the opener."""
-        if not first_meeting or chat_uid != self.home_chat_uid:
-            return
-        try:
-            await self.send(chat_uid, "👋")
-        except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
-            log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
-
-    async def _prime(self):
-        """Hand hermes SETUP_TURN in the home chat, injected the way `_goal_fire`
+    async def _prime(self, first_boot):
+        """Hand hermes WAKEUP_TURN in the home chat, injected the way `_goal_fire`
         injects a wake: signed by Plow rather than the owner, owner authority
         only in the owner's DM, and a prompt that lets the turn stay silent."""
         home = self.home_chat_uid
@@ -2946,7 +2910,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         owner_dm = _owner_dm(self._chats[home])
         authority, recall_everywhere = _authority(chat, owner_dm, human=False)
         event = MessageEvent(
-            text=SETUP_TURN,
+            text=WAKEUP_TURN.format(boot="your first boot" if first_boot else "a restart"),
             source=self.build_source(chat_id=home, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id="plow_setup", user_name="Plow setup",
                                      role_authorized=owner_dm),
@@ -2956,6 +2920,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                                            self._chats[home], self._identity, authority, speak_rule=False) + _SILENCE_OPTION,
         )
         event.authority, event.recall_everywhere = authority, recall_everywhere
+        # Spent here, not before the reads above: a failed read leaves the
+        # wakeup owed to the next session, while a hand-off that raises every
+        # time still cannot tear down every session after it.
+        global _woken
+        _woken = True
         await self._handoff_message(event)
 
     async def _backfill(self, http, chat_uid):
@@ -3013,13 +2982,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         # existing on disk is what means "not the first life"; read once,
         # here, before anything below can change it.
         first_install = not self._anchored_chats.get(self.home_chat_uid)
-        # Survives a first session that drops before reaching the setup turn,
-        # but is spent before the attempt: a turn that raises every time must
-        # not tear down every session after it.
-        owes_prime = first_install
+        global _first_boot
+        if _first_boot is None:
+            _first_boot = first_install
 
         async def session(http, connected):
-            nonlocal first_connection, owes_prime
+            nonlocal first_connection
             global _live
             if not first_connection:
                 await self._refresh_reach(http)
@@ -3059,9 +3027,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # backlog, so it cannot run ahead of an offline `/goal
                     # clear` still sitting in the queue.
                     self._goal_arm_wakes()
-                    if owes_prime:
-                        owes_prime = False
-                        await self._prime()
+                    if not _woken:
+                        await self._prime(_first_boot)
                     async for frame in ws:
                         if frame.type == aiohttp.WSMsgType.TEXT:
                             await self._on_frame(frame.json(), http)
@@ -3183,7 +3150,7 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def _deliver(self, burst, resolved, chat_uid):
         # This chat's checkpoint below may be its first ever (discovered
         # mid-connection, not yet reached by `_listen`'s per-connect loop)
-        # -- route through the greet-gated lifecycle before writing over it
+        # -- route through the anchor lifecycle before writing over it
         # directly. BEFORE the handoff, never after: `_serve_chat`'s retry
         # loop re-runs this whole call on any exception, and a failure here
         # raises, same as `_ensure_anchor` always does -- placed after
