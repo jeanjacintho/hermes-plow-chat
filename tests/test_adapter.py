@@ -5002,6 +5002,11 @@ def test_every_silence_instruction_names_the_sentinel(
     # happened. A turn that is not this agent's does not act at all.
     for guard in ("before you look anything up or use any tool", "call nothing"):
         assert guard in module._GROUP_SPEAK_RULE
+    # Addressing a PERSON hands the thread over too. The owner asked Spruce a
+    # question, then asked Sam one; Spruce answered that too, because the rule
+    # only handed the floor to another agent (his group test, 2026-09-14).
+    for handover in ("another agent, or a person by name", "is Sam's to answer"):
+        assert handover in module._GROUP_SPEAK_RULE
     assert collaboration.count(module._GROUP_SPEAK_RULE) == 1
     # A wake or setup turn is exempt: SETUP_TURN tells it to call
     # plow_list_skills once, which "call nothing, fetch nothing" forbade.
