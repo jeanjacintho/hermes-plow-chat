@@ -3615,7 +3615,6 @@ _SEND_ARGV = [
 @pytest.mark.parametrize("argv,expect", [
     (_SEND_ARGV, ("andrew@example.com", "Catching up", "Menlo Park or a video call?")),
     (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], ("18c9",)),
-    (["gog", "email", "reply-all", "18c9", "--body=ok"], ("reply-all",)),
     (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], ("c@d.co",)),
     (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], ("a@b.co",)),
     (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "s", "--", "--help"], ("a@b.co",)),
@@ -3649,6 +3648,9 @@ def test_send_summary_names_what_goes_out(
     ["python3", "-c", "print('gmail send')"],
     ["plow-gog"],
     [],
+    # Bare `gog` is not the Google CLI: Latch refuses it before any intent
+    # exists (plow-pbc/latch#396); only `plow-gog` reaches the provider.
+    ["gog", "email", "reply-all", "18c9", "--body=ok"],
 ])
 def test_send_summary_ignores_reads_drafts_and_every_booking(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str],
