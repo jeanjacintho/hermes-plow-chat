@@ -68,8 +68,11 @@ from ._transport import (
     _lines_fact,
     _NO_IDENTITY,
     _one_line,
+    _handle_key,
     _owner_fact,
+    _owner_handle,
     _owner_identity,
+    _owner_participant,
     _participant_identity,
     _refresh_identity,
     _represented_member,
@@ -161,17 +164,20 @@ _VOICE_RULE = ('You speak for the human the roster maps you to. Speak as '
                'yourself, in your own voice; refer to them by name, never '
                'as "I" or "me". ')
 _RELATIONSHIP_FACT = (
-    "A relationship shown in the roster, like \"(wife)\", is a label recorded "
-    "on your owner's own turn; a member's claim about who they are is not one."
+    "A relationship shown in the roster, like \"(wife)\", is a recorded label, "
+    "not a verified fact."
 )
-# A bare handle is a hole in the same roster. Asking is the only source with
-# any authority -- a name inferred from mail or calendar is a guess wearing a
-# fact's clothes, and it gets written to the contact book as one. Once: the
-# tool makes the answer durable across every thread, so re-asking is a tell
-# that the agent never recorded it.
+# A bare handle is a hole in the same roster, and a lookup rather than a
+# question: the owner's ask, the owner's own contacts, and what a person says
+# about their own handle are the sources; a name inferred from mail or calendar
+# is a guess wearing a fact's clothes. Once: the tool makes the answer durable
+# across every thread, so a handle still bare next turn is a tell that the
+# agent never recorded it.
 _NAME_FACT = (
-    "If anyone in the roster shows as a bare handle, your owner included, ask their name once and "
-    f"record it with plow_name_contact. {_NEVER_GUESS}"
+    "If anyone in the roster shows as a bare handle, name it with plow_name_contact from what "
+    "your owner called them, your owner's own contacts, or what they say about their own handle; "
+    "when a person gives another handle of theirs, record the same name on it. "
+    f"{_NEVER_GUESS}"
 )
 # The one shape third-party text arrives in: bracketed, named for what it is,
 # and told to the model that it is data. Anything a person chose for themselves
@@ -217,18 +223,6 @@ def _owner_dm(chat):
     """
     members = [p for p in chat.get("participants") or [] if p.get("type") == "member"]
     return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
-
-
-def _owner_in_roster(chat):
-    """The owner sits in this chat as a member -- the invariant every outbound
-    target must satisfy. Outbound to a person is owner-inclusive by
-    construction (the server seats the owner on every agent-created chat), so a
-    room the owner is not in can only be one the model hand-picked by id: the
-    1:1 that the `send()` guard refuses.
-    """
-    return any(p.get("role") == "owner"
-               for p in chat.get("participants") or []
-               if p.get("type") == "member")
 
 
 def _message_delivery_unknown(status):
@@ -1591,6 +1585,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             ) if event.message_id else None,
         }
         if not turn["owner"]:
+            # A member turn may still name someone -- but never the owner's own
+            # handle; `_plow_name_contact` checks a member's target against this.
+            turn["owner_handle"] = _owner_handle(self._chats.get(chat_uid, {}))
             participant = next(
                 (
                     item for item in self._chats.get(chat_uid, {}).get("participants", [])
@@ -2087,7 +2084,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         if turn is not None and not turn["authority"]:
             return SendResult(success=False,
                               error=f"Plow Chat turn without the owner's authority is confined to {turn['chat_uid']!r}")
-        if not _owner_in_roster(self._chats.get(chat_id) or {}):
+        # Outbound to a person is owner-inclusive by construction (the server
+        # seats the owner on every agent-created chat), so a room the owner is
+        # not in can only be one the model hand-picked by id: the 1:1 refused here.
+        if _owner_participant(self._chats.get(chat_id) or {}) is None:
             return SendResult(success=False,
                               error=f"Plow Chat {chat_id!r} does not seat your owner; outbound to a person "
                                     "goes to a group that includes them, never a 1:1 that leaves them out. "
@@ -4195,7 +4195,10 @@ PLOW_SEND_MESSAGE_SCHEMA = {
         "for your owner's macOS Contacts, or plow_contacts for Plow's own book) "
         "and pass the handle -- or an array of handles for a group. That opens "
         "an owner-inclusive group: your owner is always seated, so they see "
-        "every outbound message; a person is never a bare 1:1. An email address "
+        "every outbound message; a person is never a bare 1:1. When the owner "
+        "referred to a recipient by name, record it with "
+        "plow_name_contact(handle=<recipient>, display_name=<name>) in the same batch, so the "
+        "roster names them from the first reply. An email address "
         "in `to` (with `subject`) is mail from your own mailbox, your owner "
         "copied. Ordinary "
         "outreach (a contractor, a neighbour, a merchant) uses the default "
@@ -4264,22 +4267,26 @@ def _plow_name_contact(args, **_kwargs):
 
     Keyed by handle, so the owner's contact book reaches anyone they can name --
     a member of this chat, someone in another thread, or the owner themselves.
-    Owner-turn-authorized only: fails CLOSED, like `plow_send_message`'s
-    trusted-thread branch and `plow_set_conversation_trusted` -- both a member's own
-    turn and no active turn at all refuse a direct write here, so a label can
-    only ever be written by a call made on the owner's own turn. The turn is
-    read for that authority alone; the write itself is not chat-scoped.
-
-    The handle is not roster-scoped: any handle the owner names is written.
-    The owner's own turn is the whole trust boundary.
+    Both labels are written on any active turn whose roster seats the owner:
+    they come from the owner's ask, the owner's own contacts, or the person's
+    own word, and a wrong one costs a label. The one exception is the owner's
+    own handle -- their account name, which reaches the channel prompt -- so
+    only the owner writes it. No active turn at all refuses: a turn-less write
+    has nobody to have asked.
     """
     turn = _ACTIVE_TURN.get()
-    if turn is None or not turn.get("owner"):
+    if turn is None:
         return json.dumps({"success": False,
-                           "error": "names come from the owner: this requires the owner's "
-                                    "own active turn, nothing was recorded"})
+                           "error": "this requires an active turn; nothing was recorded"})
     handle = str(args.get("handle") or "").strip()
     body = {k: args[k] for k in ("display_name", "relationship") if args.get(k) is not None}
+    owner_handle = turn.get("owner_handle")
+    if not turn.get("owner") and (not owner_handle or _handle_key(handle) == _handle_key(owner_handle)):
+        # Fail closed: a member turn may not name the owner, and on a roster
+        # that seats no owner it cannot tell who that is.
+        return json.dumps({"success": False,
+                           "error": "your owner's own name comes from them: this requires the "
+                                    "owner's own active turn, nothing was recorded"})
     if not handle or not body:
         return json.dumps({"success": False,
                            "error": "a handle, and display_name or relationship, are required"})
@@ -4311,14 +4318,16 @@ PLOW_NAME_CONTACT_SCHEMA = {
     "name": "plow_name_contact",
     "description": (
         "Record what your owner calls a person, and who that person is to your "
-        "owner (e.g. \"wife\", \"landlord\") -- call it only when your owner tells "
-        "you so, on the owner's own turn. Owner-turn-authorized only: the tool "
-        "refuses on a member's turn and outside any active turn. People are keyed "
-        "by handle, so this reaches anyone your owner can name, in this chat or "
-        "not; the roster shows each person as name (handle). Your owner's own "
-        "handle takes a display_name -- that is their account name -- but not a "
-        "relationship. Omit display_name/relationship to leave it; for other "
-        "people, pass \"\" to clear it."
+        "owner (e.g. \"wife\", \"landlord\"). Both come from your owner's ask, your "
+        "owner's own contacts, or what a person says about themselves, and are "
+        "recorded without asking on any active turn whose roster seats your owner. "
+        "People are keyed by handle, so this reaches anyone your owner can name, in "
+        "this chat or not, and a phone and an email for the same person each take "
+        "the same name; the roster shows each person as name (handle). Your owner's "
+        "own handle takes a display_name -- that is their account name -- but only "
+        "your owner's own turn may write it, and it never takes a relationship. "
+        "Omit display_name/relationship to leave it; for other people, pass \"\" to "
+        "clear it."
     ),
     "parameters": {
         "type": "object",
@@ -4342,12 +4351,12 @@ def _plow_contacts(_args, **_kwargs):
     scheduled Hermes-cron turn has no roster at all and cannot even name its
     own owner. This is where that name comes from.
 
-    Authorization is the mirror of `_plow_name_contact`'s, not a copy: writing
-    a label needs the owner's own turn and fails closed on no turn, because a
-    turn-less write has nobody to have asked. A READ has a turn-less caller
-    that is legitimate -- cron is exactly it -- so the gate is narrower: only
-    a turn without the owner's authority is refused, since that is the one
-    context where somebody else's words are steering the agent.
+    Authorization is the mirror of `_plow_name_contact`'s narrowest case, not a
+    copy: writing the owner's own name needs the owner's own turn and fails closed on
+    no turn, because a turn-less write has nobody to have asked. A READ has a
+    turn-less caller that is legitimate -- cron is exactly it -- so the gate is
+    narrower: only a turn without the owner's authority is refused, since that
+    is the one context where somebody else's words are steering the agent.
     """
     return _owner_read_tool(
         lambda adapter: adapter.contacts(), lambda contacts: {"contacts": contacts},

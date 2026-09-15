@@ -1952,9 +1952,12 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
         composed = module._collaboration_prompt(base, chat, identity)
         assert module._RELATIONSHIP_FACT in composed
         # A bare handle is a hole in the same roster, so the instruction to
-        # fill it rides the same gate: ask, once, and record it -- rather than
-        # inventing a name out of the owner's mail or calendar.
-        assert "ask their name once" in composed
+        # fill it rides the same gate: name it from the owner's ask, contacts,
+        # or the person's own word -- rather than inventing one out of mail or
+        # calendar.
+        assert "your owner's own contacts" in composed
+        assert "their own handle" in composed and "same name" in composed
+        assert module._NEVER_GUESS in composed
         assert "plow_name_contact" in composed
     # OWNER_CHANNEL_PROMPT is only ever selected for a solo DM turn, so that's
     # the composition a real turn produces -- not this group chat.
@@ -2372,19 +2375,37 @@ def _authority_case_cross_chat_send(module: Any, monkeypatch: pytest.MonkeyPatch
 
 
 def _authority_case_name_a_contact(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """Both labels are written on any active turn -- they come from the
+    owner's ask, the owner's contacts, or the person's own word, all of which
+    can land on a member's turn. The owner's own handle is written on the
+    owner's turn or not at all."""
     record: list[Any] = []
     _live_tool(module, monkeypatch, "name_contact",
                result={"display_name": "Abby", "relationship": "wife"}, record=record)
+    # A roster that seats no owner cannot say who a member may not name, so a
+    # member turn there writes nothing; the owner's own turn needs no roster.
     module._ACTIVE_TURN.set(turn)
-    out = json.loads(module._plow_name_contact(
+    display = json.loads(module._plow_name_contact({"handle": "+15550000002", "display_name": "Abby"}))
+    assert display["success"] is authorized
+    assert record == ([("+15550000002", {"display_name": "Abby"})] if authorized else [])
+    record.clear()
+    module._ACTIVE_TURN.set(turn and {**turn, "owner_handle": "+15550000001"})
+    display = json.loads(module._plow_name_contact(
         {"handle": "+15550000002", "display_name": "Abby", "relationship": "wife"}))
-    assert out["success"] is authorized
-    if authorized:
-        # No chat id rides along: the contact book is keyed by handle, not by room.
-        assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
-    else:
-        assert "owner" in out["error"]
-        assert record == []
+    assert display["success"] is (turn is not None)
+    # No chat id rides along: the contact book is keyed by handle, not by room.
+    assert record == ([("+15550000002", {"display_name": "Abby", "relationship": "wife"})] if turn else [])
+    for body in ({"handle": "+15550000001", "display_name": "Sam"},
+                 {"handle": "+1 (555) 000-0001", "display_name": "Sam"}):   # canonically the owner
+        record.clear()
+        args = {"handle": "+15550000002", **body}
+        out = json.loads(module._plow_name_contact(args))
+        assert out["success"] is authorized
+        if authorized:
+            assert record == [(args["handle"], {k: v for k, v in args.items() if k != "handle"})]
+        else:
+            assert ("active turn" if turn is None else "owner") in out["error"]
+            assert record == []
 
 
 def _authority_case_read_the_book(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
@@ -2695,6 +2716,11 @@ def test_tools_register_with_optional_deferred_questions(
     name_contact_tool = tools["plow_name_contact"]
     assert name_contact_tool["schema"]["parameters"]["required"] == ["handle"]
     assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    # The description carries the split the gate enforces: a display name on
+    # any turn, a relationship on the owner's; and the send tool says to name
+    # a recipient the owner called by name in the same batch.
+    assert "any active turn" in name_contact_tool["schema"]["description"]
+    assert "plow_name_contact" in send_message_tool["schema"]["description"]
     assert name_contact_tool["check_fn"]()
 
     contacts_tool = tools["plow_contacts"]
@@ -3029,7 +3055,7 @@ def test_invite_workflow_reports_delivery_failure(
             "missing",
             {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False, "recall_everywhere": False,
              "no_reply_ok": False, "recall_text": None,
-             "source_message_id": "msg_delight_1"},
+             "source_message_id": "msg_delight_1", "owner_handle": "+15550000001"},
             id="missing-participant",
         ),
         pytest.param(
@@ -3041,7 +3067,8 @@ def test_invite_workflow_reports_delivery_failure(
                 "provider_key": "+17035550123",
             },
             "cp_taylor",
-            _invite_turn(participant_identity="Taylor Injected suffix", triggered_at=mock.ANY),
+            _invite_turn(participant_identity="Taylor Injected suffix", triggered_at=mock.ANY,
+                         owner_handle="+15550000001"),
             id="normalized-name",
         ),
         pytest.param(
@@ -3057,6 +3084,7 @@ def test_invite_workflow_reports_delivery_failure(
                 participant_uid="cp_phone",
                 participant_identity="+17035550124",
                 triggered_at=mock.ANY,
+                owner_handle="+15550000001",
             ),
             id="phone-fallback",
         ),
