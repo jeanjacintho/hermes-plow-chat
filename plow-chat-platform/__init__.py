@@ -1310,6 +1310,7 @@ class _Inbound:
     sender: dict
     starts_slash_command: bool
     resolved: asyncio.Task                   # of _resolve_parts: begun on arrival, awaited by the burst
+    has_text: bool = False                   # words of their own, not the "(attachment)" stand-in
     reply_to: dict | None = None
 
 
@@ -1530,13 +1531,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         owner's task -- which also left the owner, in their own DM, no way but
         `/stop` to stop or redirect a long task, a Latch browser run included
         (#194). The gateway reads its busy mode per profile, never per sender,
-        so the sender is decided here: a message `_deliver` marked
-        `interrupts_run` takes the gateway's own interrupt path -- queued as the
-        next turn, then the run interrupted, which also aborts an in-flight MCP
-        call. Its subagent and compression demotions still apply.
+        so the sender is decided here: text `_deliver` marked `interrupts_run`
+        takes the gateway's own interrupt path -- queued as the next turn, then
+        the run interrupted, which also aborts an in-flight MCP call. Its
+        subagent and compression demotions still apply.
         """
-        runner = getattr(handler, "__self__", None)
-        if runner is None:
+        if handler is None:
             return super().set_busy_session_handler(handler)
 
         async def owner_interrupts(event, session_key):
@@ -1547,6 +1547,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             # queue it next. Anything else keeps that.
             if not getattr(event, "interrupts_run", False):
                 return False
+            # Bound to this adapter before any handler is wired
+            # (`run_adapters.py:1473-1478`).
+            runner = self.gateway_runner
             state = runner._peek_session_state(session_key)
             agent = state.turn.agent if state else None
             outcome = await runner._resolve_busy_steer_or_redirect(event, session_key, "interrupt", agent)
@@ -3165,6 +3168,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 sender,
                 msg["body"].startswith("/"),
                 asyncio.create_task(_resolve_parts(msg)),
+                bool(msg["body"].strip()),
                 msg.get("reply_to"),
             )
         )
@@ -3280,9 +3284,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         event.recall_text = spoken
         event.authority, event.recall_everywhere = authority, recall_everywhere
         # Every word in the owner's own DM is addressed to this agent, so there
-        # a message mid-run is a correction; elsewhere it may be an aside.
+        # a message mid-run is a correction; elsewhere it may be an aside. Their
+        # words, not a bare attachment: hermes queues media mid-run rather than
+        # interrupting for it, and a part whose fetch failed arrives as a note
+        # in `text` -- which would otherwise abort the task it illustrates.
         event.interrupts_run = (role == "owner" and chat["type"] == "dm"
-                                and not burst[0].starts_slash_command)
+                                and not burst[0].starts_slash_command
+                                and any(part.has_text for part in burst))
         await self._handoff_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the

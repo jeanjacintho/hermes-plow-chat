@@ -210,10 +210,12 @@ the rest of the chat waiting behind it.
 A message that lands while the agent is mid-run waits for that run and gets its
 own turn (the image sets `busy_input_mode: queue`), so a group's asides never
 redirect the owner's task. The owner's own DM is the exception: every word there
-is addressed to the agent, so a non-command message from the owner is queued as
-the next turn and the running task is interrupted — including an in-flight Latch
-browser call. Hermes still skips the interrupt while subagents or context
-compression are running; `/stop` stays the escape hatch everywhere.
+is addressed to the agent, so a non-command text message from the owner is
+queued as the next turn and the running task is interrupted — including an
+in-flight Latch browser call. A bare attachment is not that message: hermes
+queues media mid-run rather than interrupting for it. Hermes also skips the
+interrupt while subagents or context compression are running; `/stop` stays the
+escape hatch everywhere.
 
 Inline replies carry the quoted sender, time, and body as untrusted turn data,
 with a part label only for media. If the reply has no attachments of its own,
