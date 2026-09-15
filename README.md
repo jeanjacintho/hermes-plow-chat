@@ -251,7 +251,9 @@ turn and a goal wake have no human speaker, so trust grants them nothing. In
 discretion, a member's ask still waits for the owner's yes given in this thread,
 judged from the conversation, disclosing only what answers the request. Consent
 is the second question: in a shared room the first is whether the turn is the
-agent's to answer at all (below), and an unaddressed ask never reaches consent. A standing
+agent's to answer at all (below), and an unaddressed ask never reaches consent -- except
+praise of the agent or an ask for an agent of one's own, which still starts
+`plow_offer_invite` (below). A standing
 secret — a password, backup code, API key, raw token, or full card number — is
 refused regardless of authority. Email sends and calendar-conflict overrides need a
 turn with the owner's authority; an email's approval posts in the room that asked,
