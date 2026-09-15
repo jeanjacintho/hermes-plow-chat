@@ -114,6 +114,9 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
 
         async def handle_message(self, event: Any) -> None: ...
 
+        def set_busy_session_handler(self, handler: Any) -> None:
+            self._busy_session_handler = handler
+
         def _mark_connected(self) -> None: ...
         def _mark_disconnected(self) -> None: ...
 
@@ -7854,3 +7857,59 @@ async def test_recall_searches_what_was_said_not_the_rendered_prompt(
     terms = module._recall_query(handled[0].recall_text).removeprefix("{content} : (").removesuffix(")")
     assert "untrusted" not in terms, "the fence is not a search term"
     assert terms.split(" OR ")[0] in expected.lower()
+
+
+async def test_only_the_owners_own_dm_text_interrupts_a_busy_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """#194: the image queues every mid-run message, so an owner texting
+    "stop" mid-task waited for the task. In the owner's own DM the text is
+    queued as the next turn AND the run is interrupted; a group message, a
+    member's, or a command keeps the queue -- and so does a run whose
+    subagents the gateway will not abort."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_dm_chat(), _chat("cht_g", group=True)])
+    _mark_anchored(adapter, "cht_a", "cht_g")
+    handled = _capture_events(monkeypatch, adapter)
+    for event_id, chat, role, body in (("e1", "cht_a", "owner", "stop, do X"), ("e2", "cht_a", "owner", "/model"),
+                                       ("e3", "cht_g", "owner", "lol"), ("e4", "cht_g", "member", "hi")):
+        await adapter._on_frame(_envelope(event_id, chat, f"m_{event_id}", role=role, body=body), object())
+    await _settle(adapter)
+    assert [e.interrupts_run for e in handled] == [True, False, False, False]
+
+    calls: list[tuple[str, str]] = []
+    agent = SimpleNamespace(interrupt=lambda text: calls.append(("interrupt", text)))
+
+    class Runner:
+        mode = "interrupt"
+
+        async def busy(self, event: Any, session_key: str) -> bool:
+            return False                        # the gateway's queue-mode text branch
+
+        def _peek_session_state(self, session_key: str) -> Any:
+            return SimpleNamespace(turn=SimpleNamespace(agent=agent))
+
+        async def _resolve_busy_steer_or_redirect(self, event: Any, key: str, mode: str, running: Any) -> Any:
+            return SimpleNamespace(effective_mode=self.mode, redirected=False)
+
+        def _queue_or_replace_pending_event(self, session_key: str, event: Any) -> None:
+            calls.append(("queue", event.text))
+
+        async def _interrupt_running_agent_for_busy_event(self, event: Any, adapter_: Any, running: Any) -> None:
+            running.interrupt(event.text)
+
+    runner = Runner()
+    adapter.set_busy_session_handler(runner.busy)
+    busy = adapter._busy_session_handler
+    for event in handled[1:]:
+        assert await busy(event, "k") is False
+    assert calls == []
+    assert await busy(handled[0], "k") is True
+    assert calls == [("queue", handled[0].text), ("interrupt", handled[0].text)]
+
+    calls.clear()
+    runner.mode = "queue"                       # demoted: subagents or compression in flight
+    assert await busy(handled[0], "k") is True
+    assert calls == [("queue", handled[0].text)]
