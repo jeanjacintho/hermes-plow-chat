@@ -212,10 +212,10 @@ own turn (the image sets `busy_input_mode: queue`), so a group's asides never
 redirect the owner's task. The owner's own DM is the exception: every word there
 is addressed to the agent, so a non-command text message from the owner is
 queued as the next turn and the running task is interrupted — including an
-in-flight Latch browser call. A bare attachment is not that message: hermes
-queues media mid-run rather than interrupting for it. Hermes also skips the
-interrupt while subagents or context compression are running; `/stop` stays the
-escape hatch everywhere.
+in-flight Latch browser call. Words only: a turn that reaches hermes carrying
+media, captioned or not, stays on its media queue, which is hermes's own
+photo-burst behaviour. Hermes also skips the interrupt while subagents or
+context compression are running; `/stop` stays the escape hatch everywhere.
 
 Inline replies carry the quoted sender, time, and body as untrusted turn data,
 with a part label only for media. If the reply has no attachments of its own,

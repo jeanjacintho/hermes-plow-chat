@@ -1535,6 +1535,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         takes the gateway's own interrupt path -- queued as the next turn, then
         the run interrupted, which also aborts an in-flight MCP call. Its
         subagent and compression demotions still apply.
+
+        Only what the gateway would have queued as text reaches that path. A
+        turn carrying media it already accepted is its own to queue, and the
+        `True` it returns for one is the same `True` it returns for a drain
+        notice or a plaintext approval reply -- an interrupt keyed on that
+        would abort the very run an approved tool call belongs to.
         """
         if handler is None:
             return super().set_busy_session_handler(handler)
@@ -3284,12 +3290,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         event.recall_text = spoken
         event.authority, event.recall_everywhere = authority, recall_everywhere
         # Every word in the owner's own DM is addressed to this agent, so there
-        # a message mid-run is a correction; elsewhere it may be an aside. Their
-        # words, not a bare attachment: hermes queues media mid-run rather than
-        # interrupting for it, and a part whose fetch failed arrives as a note
-        # in `text` -- which would otherwise abort the task it illustrates.
+        # a message mid-run is a correction; elsewhere it may be an aside.
+        # Their words and nothing else: hermes takes a turn carrying media off
+        # the interrupt path itself -- its own photo-burst semantics -- so a
+        # caption that claimed this marker would promise an interrupt that
+        # never came. A part whose fetch failed arrives as a note in `text`,
+        # which is not words of theirs either.
         event.interrupts_run = (role == "owner" and chat["type"] == "dm"
                                 and not burst[0].starts_slash_command
+                                and not media_urls and not media_types
                                 and any(part.has_text for part in burst))
         await self._handoff_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first

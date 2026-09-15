@@ -7870,8 +7870,10 @@ async def test_only_the_owners_own_dm_text_interrupts_a_busy_run(
     """#194: the image queues every mid-run message, so an owner texting
     "stop" mid-task waited for the task. In the owner's own DM the text is
     queued as the next turn AND the run is interrupted; a group message, a
-    member's, a command, and an attachment with no words of its own keep the
-    queue -- and so does a run whose subagents the gateway will not abort."""
+    member's, a command, and anything carrying media -- captioned or bare --
+    keep the queue, and so does a run whose subagents the gateway will not
+    abort. A caption must not claim the marker: hermes takes a turn with media
+    off the interrupt path itself, so the promise would never be kept."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_dm_chat(), _chat("cht_g", group=True)])
@@ -7891,13 +7893,15 @@ async def test_only_the_owners_own_dm_text_interrupts_a_busy_run(
             ("e3", "cht_g", "owner", "lol", None),
             ("e4", "cht_g", "member", "hi", None),
             ("e5", "cht_a", "owner", "", [_attachment()]),
-            ("e6", "cht_a", "owner", "", [_attachment(filename="gone.png")])):
+            ("e6", "cht_a", "owner", "", [_attachment(filename="gone.png")]),
+            ("e7", "cht_a", "owner", "stop, do X", [_attachment()])):
         await adapter._on_frame(
             _envelope(event_id, chat, f"m_{event_id}", role=role, body=body, attachments=parts), object())
         await _settle(adapter)             # one burst per frame, whoever spoke last
     assert [(_turn_body(e.text), e.interrupts_run) for e in handled] == [
         ("stop, do X", True), ("/model", False), ("lol", False), ("hi", False),
         ("(attachment)", False), ("[attachment: image/png unavailable]", False),
+        ("stop, do X", False),
     ]
 
     calls: list[tuple[str, str]] = []
