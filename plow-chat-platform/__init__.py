@@ -1375,6 +1375,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._live_turns = {}
         self._sequence_locks = {}
         self._sequences = {}
+        self._unknown_voice_sends: set[tuple[str, str]] = set()
 
     def _checkpoint_path(self, chat_uid):
         if chat_uid == self._configured_home_chat_uid:
@@ -2511,8 +2512,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         log.info("[plow_chat] dropped status frame %r for %s", status_key, chat_id)
         return SendResult(success=True)
 
-    async def _post_message(self, http, chat_id, payload, metadata=None):
-        async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
+    async def _post_message(self, http, chat_id, payload, metadata=None, *, voice: bool = False):
+        endpoint = "voicememo" if voice else "messages"
+        async with http.post(f"{BASE}/v1/chats/{chat_id}/{endpoint}",
                              json=payload, headers=self.auth) as resp:
             if _message_delivery_unknown(resp.status):
                 # Classify on status BEFORE reading the body: a 408/424/5xx can
@@ -2658,7 +2660,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             receipt["instruction"] = "Do not replay the sequence; inspect chat history before sending remaining items."
         return receipt
 
-    async def _send_attachment(self, chat_id, path, *, caption=None, filename=None):
+    async def _send_attachment(self, chat_id, path, *, caption=None, filename=None, voice: bool = False):
         """Declare, upload, send — the Plow media contract, in that order.
 
         The declare and the send carry the bearer; the PUT goes to the
@@ -2672,6 +2674,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         refused = self._message_guard(chat_id)
         if refused is not None:
             return refused
+        caption = (caption or "").strip()
         filename = filename or os.path.basename(path)
         with open(path, "rb") as fh:
             data = fh.read()
@@ -2690,18 +2693,45 @@ class PlowChatAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"attachment upload {resp.status}")
             result = await self._post_message(
                 http, chat_id,
-                {"body": (caption or "").strip(), "attachment_uids": [declared["uid"]]})
+                {"attachment_uid": declared["uid"]} if voice else
+                {"body": caption, "attachment_uids": [declared["uid"]]}, voice=voice)
+            if not result.success:
+                return result
             # Attachments are turns too. Left out, a goal whose whole answer was
             # a file read to the judge as an agent that said nothing.
-            if getattr(result, "success", False):
-                self._goal_note_reply(chat_id, (caption or "").strip() or f"(sent {filename})")
+            self._goal_note_reply(chat_id, caption if caption and not voice else f"(sent {filename})")
+            if voice and caption:
+                # The memo is already sent. A failed caption must not turn its
+                # receipt into a failure that could cause the audio to be resent.
+                try:
+                    caption_result = await self._post_message(http, chat_id, {"body": caption})
+                except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                    log.warning("[plow_chat] voice memo caption failed for %s: %s", chat_id, type(exc).__name__)
+                else:
+                    if caption_result.success:
+                        self._goal_note_reply(chat_id, caption)
+                    else:
+                        log.warning("[plow_chat] voice memo caption failed for %s", chat_id)
             return result
 
     async def send_image_file(self, chat_id, image_path, caption=None, **_kwargs):
         return await self._send_attachment(chat_id, image_path, caption=caption)
 
     async def send_voice(self, chat_id, audio_path, caption=None, **_kwargs):
-        return await self._send_attachment(chat_id, audio_path, caption=caption)
+        key = (chat_id, audio_path)
+        self._unknown_voice_sends.discard(key)
+        result = await self._send_attachment(chat_id, audio_path, caption=caption, voice=True)
+        if (result.raw_response or {}).get("delivery_unknown") is True:
+            self._unknown_voice_sends.add(key)
+        return result
+
+    async def _notify_media_delivery_failure(self, chat_id, media_path, *, is_voice=False, metadata=None):
+        # The gateway passes no send result to this hook; consume its marker once.
+        key = (chat_id, media_path)
+        if key in self._unknown_voice_sends:
+            self._unknown_voice_sends.remove(key)
+            return
+        await super()._notify_media_delivery_failure(chat_id, media_path, is_voice=is_voice, metadata=metadata)
 
     async def send_video(self, chat_id, video_path, caption=None, **_kwargs):
         return await self._send_attachment(chat_id, video_path, caption=caption)
