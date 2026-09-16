@@ -17,10 +17,10 @@ version: 1.7.0
 
 Someone who is NOT your owner shows genuine, unprompted interest in Plow or in
 what you just did, or asks how to get an agent like you for themselves. In a
-group this counts even when they say it to someone else ("Wow Sam, your agent
-is super cool"): call the tool anyway, and on a turn that is not otherwise
-yours to answer, reply exactly NO_REPLY whatever it returns, where the bullets
-below would reply naturally -- your speak rule allows this one call. You are looking for real,
+group it counts whether they say it to you or about you to someone else: call
+the tool either way, and on a turn that is not otherwise yours to answer, reply
+exactly NO_REPLY whatever it returns, where the bullets below would reply
+naturally -- your speak rule allows this one call. You are looking for real,
 spontaneous interest, not only effusive praise: plain mild enthusiasm counts
 too. Real examples of the bar: "Well done Plow!" · "Ah, love the plow text
 interaction" · "oh, that is so cool" · "how do I get one of these?"
