@@ -5186,6 +5186,11 @@ def test_every_silence_instruction_names_the_sentinel(
     # happened. A turn that is not this agent's does not act at all.
     for guard in ("before you look anything up or use any tool", "call nothing"):
         assert guard in module._GROUP_SPEAK_RULE
+    # ...except the invite: praise spoken to somebody else is still an invite
+    # opening, or the delight trigger can never fire in a group at all.
+    for carve_out in ("call plow_offer_invite", "spoken about you to somebody else",
+                      "Call nothing else", "whatever the tool returns"):
+        assert carve_out in module._GROUP_SPEAK_RULE
     # Addressing a PERSON hands the thread over too. The owner asked Spruce a
     # question, then asked Sam one; Spruce answered that too, because the rule
     # only handed the floor to another agent (his group test, 2026-09-14).
