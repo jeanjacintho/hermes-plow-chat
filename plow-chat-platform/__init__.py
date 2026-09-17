@@ -959,15 +959,10 @@ def _latch_section(_session_info: Mapping[str, Any]) -> str:
     return LATCH_PROMPT if os.environ.get("PLOW_MCP_URL") else ""
 
 
-# Hermes' MCP client gives a dropped server five quick retries (~30 s) and
-# then parks it for 300 s with its tools deregistered. A Plow API deploy
-# drops the Mac's relay socket for ~2 min several times a day, so a parked
-# Latch is the ordinary state an owner's next message finds -- and the API
-# is long back by then. Reconnect it here, before Hermes snapshots this
-# turn's tools (agent/turn_context._refresh_mcp_tools_between_turns runs
-# after this hook), so the turn has its plow_ tools instead of "Unknown
-# tool". Private Hermes names, pinned by the base image; any miss logs and
-# the turn proceeds without the Mac, as it would have anyway.
+# Hermes parks a dropped MCP server with its tools deregistered. Reconnect
+# the Mac link best-effort in the background so a later turn can regain its
+# tools, without delaying the current turn. Private Hermes names are pinned
+# by the base image; a failed reconnect is logged and does not block the turn.
 def _wake_mac_link() -> None:
     url = os.environ.get("PLOW_MCP_URL")
     if not url or "tools.mcp_tool" not in sys.modules:
@@ -1528,6 +1523,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
         self._goal_paced = False              # pacing runs only inside a live socket session
         self._active_turn = _ACTIVE_TURN
+        # The turn-start Mac wake, scheduled and never awaited. Held so it is
+        # not garbage-collected mid-flight, and so a wake already running is
+        # not joined by a second one on the next turn.
+        self._mac_wake = None
         self._live_turns = {}
         self._sequence_locks = {}
         self._sequences = {}
@@ -1773,8 +1772,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                               retryable=False)
 
     async def on_processing_start(self, event):
-        # Off the loop: the wait polls with time.sleep, up to 15 s.
-        await asyncio.to_thread(_wake_mac_link)
+        # Reconnect best-effort in the background; this turn does not wait
+        # for the Mac's tools. Reuse an in-flight wake so turns cannot pile up
+        # workers waiting on the same parked link.
+        if self._mac_wake is None or self._mac_wake.done():
+            self._mac_wake = asyncio.create_task(asyncio.to_thread(_wake_mac_link))
         chat_uid = event.source.chat_id
         # Hermes builds its own events and swallows a raise here, so an
         # unstamped event is a speakerless wake read from nothing that can raise.
