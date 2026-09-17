@@ -1056,8 +1056,9 @@ def test_guest_turn_is_not_tool_blocked(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     turn = adapter._active_turn.set({"chat_uid": "cht_b", "owner": False})
     try:
-        assert set(hooks) == {"pre_tool_call", "pre_llm_call", "transform_tool_result"}
+        assert set(hooks) == {"pre_tool_call", "pre_llm_call", "post_llm_call", "transform_tool_result"}
         assert hooks["pre_llm_call"] is module._recall
+        assert hooks["post_llm_call"] is module._capture_people
         assert hooks["pre_tool_call"](
             tool_name="mcp__latch__plow_run_command",
             args={"argv": ["plow-gog", "gmail", "search", "newer_than:7d"]},
@@ -1726,6 +1727,29 @@ async def test_authority_selects_the_prompt(
     await adapter.on_processing_start(event)
     assert (adapter._send_guard("cht_other") is None) is authority, "the turn's gates follow its authority"
     await adapter.on_processing_complete(event, None)
+
+
+@pytest.mark.parametrize("user_id, expected", [
+    ("mem_owner_cht_b", "+15550000001"),   # the owner's own turn
+    ("mem_other_cht_b", "+15550000002"),   # a member's turn
+    ("plow_goal", None),                   # a wake: nobody spoke
+])
+async def test_every_turn_carries_the_speakers_handle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, user_id: str, expected: str | None
+) -> None:
+    """The capture hook names people from what the SPEAKER said, so the turn
+    record says who that is as a handle -- the key the contact book uses --
+    or None on a wake, which has no speaker to learn from."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="cht_b", chat_type="group", user_id=user_id,
+                               role_authorized=user_id == "mem_owner_cht_b"),
+        message_id="msg_1", authority=True, recall_everywhere=False, channel_prompt="",
+    )
+    await adapter.on_processing_start(event)
+    assert adapter._active_turn.get()["speaker_handle"] == expected
 
 
 # What an owner turn is told about its own owner. Both name the OWNER, whose
@@ -2415,6 +2439,340 @@ def _authority_case_name_a_contact(module: Any, monkeypatch: pytest.MonkeyPatch,
             assert record == []
 
 
+_PEOPLE_ROSTER = {"15550000001": "+15550000001", "15550000002": "+15550000002"}
+_BOOK_INDEX = {"15550000001": {"display_name": "Sam", "relationship": None},
+               "15550000003": {"display_name": "Abby", "relationship": None}}
+
+
+@pytest.mark.parametrize("case, owner, speaker, facts, expected", [
+    # The owner names a bare member from "Hey Patrick".
+    ("owner names a member", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Patrick"}],
+     {"+15550000002": {"display_name": "Patrick"}}),
+    # The owner states a relationship for someone already in the book (a DM: no roster row).
+    ("owner states a relationship", True, "+15550000001",
+     [{"handle": "+15550000003", "relationship": "wife"}],
+     {"+15550000003": {"relationship": "wife"}}),
+    # Later owner words overwrite: the book said wife, the owner now says cousin.
+    ("owner overwrites", True, "+15550000001",
+     [{"handle": "+15550000003", "display_name": "Abby", "relationship": "cousin"}],
+     {"+15550000003": {"relationship": "cousin"}}),
+    # A handle nobody knows is dropped, not invented.
+    ("owner names a stranger", True, "+15550000001",
+     [{"handle": "+15559999999", "display_name": "Nobody"}], {}),
+    # The owner's own handle takes a name, never a relationship.
+    ("owner's own row", True, "+15550000001",
+     [{"handle": "+15550000001", "display_name": "Samuel", "relationship": "self"}],
+     {"+15550000001": {"display_name": "Samuel"}}),
+    # A member names themself; the email they claim as theirs is not taken on
+    # their word -- an alias lands a name on a handle nobody has verified.
+    ("member names self, their alias is dropped", False, "+15550000002",
+     [{"handle": "+15550000002", "display_name": "Patrick Salyer", "same_person_as": "p@mayfield.com"}],
+     {"+15550000002": {"display_name": "Patrick Salyer"}}),
+    # A member may not label anyone else, nor themself with a relationship.
+    ("member labels others", False, "+15550000002",
+     [{"handle": "+15550000001", "display_name": "Sammy"},
+      {"handle": "+15550000002", "relationship": "investor"}], {}),
+    # A member fills empties only: Abby is named, a member cannot rename her.
+    ("member cannot rename a named row", False, "+15550000003",
+     [{"handle": "+15550000003", "display_name": "Abigail"}], {}),
+    # An alias that is not a handle is dropped.
+    ("alias must be a handle", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Pat", "same_person_as": "Patrick S."}],
+     {"+15550000002": {"display_name": "Pat"}}),
+    # An alias with no digit does not look like a phone, so it is dropped too.
+    ("alias must contain a digit to look like a phone", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Pat", "same_person_as": "-------"}],
+     {"+15550000002": {"display_name": "Pat"}}),
+    # Punctuation pads the character count but the digit count decides: six
+    # digits behind two dashes still is not a phone.
+    ("alias with 7+ characters but fewer than 7 digits is not a phone", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Pat", "same_person_as": "12-34-56"}],
+     {"+15550000002": {"display_name": "Pat"}}),
+    # Two facts about the same handle in one call merge, they don't clobber each other.
+    ("two facts about one handle merge", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Patrick"},
+      {"handle": "+15550000002", "relationship": "friend"}],
+     {"+15550000002": {"display_name": "Patrick", "relationship": "friend"}}),
+    # An alias never overwrites a row the book already has a name for.
+    ("alias may not overwrite an already-named row", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Patrick", "same_person_as": "+15550000003"}],
+     {"+15550000002": {"display_name": "Patrick"}}),
+    # A member fills their own empty field once per call: the second same-call
+    # fact sees it already filled, not the stale book row.
+    ("member states their name twice in one call, the first fills it", False, "+15550000002",
+     [{"handle": "+15550000002", "display_name": "Pat"},
+      {"handle": "+15550000002", "display_name": "Patrick"}],
+     {"+15550000002": {"display_name": "Pat"}}),
+    # A same-call fact that only carries an alias still picks up the name a
+    # separate fact about the same handle just gave, not a stale empty one.
+    ("an alias fact picks up the name a separate fact in the same call gave", True, "+15550000001",
+     [{"handle": "+15550000002", "display_name": "Patrick"},
+      {"handle": "+15550000002", "same_person_as": "p@mayfield.com"}],
+     {"+15550000002": {"display_name": "Patrick"}, "p@mayfield.com": {"display_name": "Patrick"}}),
+])
+def test_only_the_speakers_own_facts_reach_the_book(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    case: str, owner: bool, speaker: str, facts: list[dict[str, Any]], expected: dict[str, dict[str, str]],
+) -> None:
+    """The classifier proposes; this decides. The owner's words set anything
+    for anyone known and overwrite; a member's words fill their own empty
+    row and nothing else; nobody invents a handle."""
+    module = _load(monkeypatch, tmp_path)
+    known = dict(_PEOPLE_ROSTER, **{"15550000003": "+15550000003"}) if owner else dict(_PEOPLE_ROSTER)
+    book = {k: dict(v) for k, v in _BOOK_INDEX.items()}
+    if not owner and speaker == "+15550000003":
+        known["15550000003"] = "+15550000003"
+    out = module._admit_people_facts(facts, owner=owner, speaker_handle=speaker,
+                                     owner_handle="+15550000001", known=known, book=book)
+    assert out == expected, case
+
+
+class _PeopleLlm:
+    def __init__(self, facts: list[dict[str, Any]] | Exception) -> None:
+        self.facts = facts
+        self.calls: list[dict[str, Any]] = []
+
+    async def acomplete_structured(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if isinstance(self.facts, Exception):
+            raise self.facts
+        return SimpleNamespace(parsed={"facts": self.facts})
+
+
+def _people_adapter(module: Any, monkeypatch: pytest.MonkeyPatch, chats: list[dict[str, Any]],
+                    book: list[dict[str, Any]]) -> tuple[Any, list[tuple[str, dict[str, Any]]]]:
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach(chats)
+    written: list[tuple[str, dict[str, Any]]] = []
+
+    async def contacts() -> list[dict[str, Any]]:
+        return book
+
+    async def name_contact(handle: str, body: dict[str, Any]) -> dict[str, Any]:
+        written.append((handle, body))
+        return {"provider_key": handle, **body}
+
+    adapter.contacts, adapter.name_contact = contacts, name_contact
+    return adapter, written
+
+
+@pytest.mark.parametrize("owner, spoken, facts, expected", [
+    (True, "Hey Patrick - sorry for the delay!",
+     [{"handle": "+15550000002", "display_name": "Patrick"}],
+     [("+15550000002", {"display_name": "Patrick"})]),
+    # A member's own name lands; the email they claim as theirs does not.
+    (False, "This is Patrick Salyer, psalyer@mayfield.com",
+     [{"handle": "+15550000002", "display_name": "Patrick Salyer", "same_person_as": "psalyer@mayfield.com"}],
+     [("+15550000002", {"display_name": "Patrick Salyer"})]),
+    (False, "Sam's wife is Abby", [{"handle": "+15550000001", "relationship": "husband of Abby"}], []),
+])
+async def test_what_a_speaker_says_about_people_lands_in_the_book(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    owner: bool, spoken: str, facts: list[dict[str, Any]], expected: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A turn's own words are classified and the admitted facts are written --
+    with nobody choosing to call a tool."""
+    module = _load(monkeypatch, tmp_path)
+    module._plugin_llm = _PeopleLlm(facts)
+    adapter, written = _people_adapter(module, monkeypatch, [_chat("cht_a"), _chat("cht_b", group=True)], _BOOK[:1])
+    turn = {"chat_uid": "cht_b", "owner": owner, "recall_text": spoken,
+            "speaker_handle": "+15550000001" if owner else "+15550000002"}
+    await module._capture_people_turn(adapter, adapter._chats["cht_b"], turn)
+    assert written == expected
+    # The classifier saw the speaker's words and the people it may name -- never the agent's reply.
+    prompt_text = module._plugin_llm.calls[0]["input"][0]["text"]
+    assert spoken in prompt_text and "+15550000002" in prompt_text
+
+
+async def test_the_owners_dm_words_reach_someone_in_the_book_but_not_the_room(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """"abby is my wife" is said in the owner's DM, where Abby has no roster
+    row: the book is what the classifier gets to name her from."""
+    module = _load(monkeypatch, tmp_path)
+    module._plugin_llm = _PeopleLlm([{"handle": "+15550000002", "relationship": "wife"}])
+    adapter, written = _people_adapter(module, monkeypatch, [_dm_chat()], _BOOK)
+    turn = {"chat_uid": "cht_a", "owner": True, "recall_text": "abby is my wife", "speaker_handle": "+15550000001"}
+    await module._capture_people_turn(adapter, adapter._chats["cht_a"], turn)
+    assert written == []            # the book already says wife: nothing to change
+    assert "Abby (+15550000002)" in module._plugin_llm.calls[0]["input"][0]["text"]
+
+
+async def test_a_members_turn_never_shows_the_classifier_the_owners_book(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._plugin_llm = _PeopleLlm([])
+    adapter, _written = _people_adapter(module, monkeypatch, [_chat("cht_a"), _chat("cht_b", group=True)], _BOOK)
+    turn = {"chat_uid": "cht_b", "owner": False, "recall_text": "hi", "speaker_handle": "+15550000002"}
+    await module._capture_people_turn(adapter, adapter._chats["cht_b"], turn)
+    assert "Abby" not in module._plugin_llm.calls[0]["input"][0]["text"]
+
+
+@pytest.mark.parametrize("turn", [
+    None,
+    {"chat_uid": "cht_b", "owner": True, "recall_text": "Hey Patrick", "speaker_handle": None},   # a wake
+    {"chat_uid": "cht_b", "owner": True, "recall_text": "", "speaker_handle": "+15550000001"},     # nothing said
+])
+def test_the_hook_is_silent_without_a_speaker_or_words(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._plugin_llm = _PeopleLlm([{"handle": "+15550000002", "display_name": "Patrick"}])
+    adapter = _live_tool(module, monkeypatch, "contacts", result=_BOOK)
+    module._ACTIVE_TURN.set(turn)
+    assert module._capture_people("s1", "Hey Patrick", module.PLATFORM_NAME) is None
+    # Drain the adapter loop before asserting: a wrongly scheduled coroutine
+    # would have recorded its call by the time this sleep completes, since
+    # _PeopleLlm.acomplete_structured appends to calls before any await.
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0), module._live[1]).result(timeout=1)
+    assert module._plugin_llm.calls == []
+
+
+async def test_a_failing_classifier_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._plugin_llm = _PeopleLlm(RuntimeError("down"))
+    adapter, written = _people_adapter(module, monkeypatch, [_chat("cht_a"), _chat("cht_b", group=True)], _BOOK)
+    turn = {"chat_uid": "cht_b", "owner": True, "recall_text": "Hey Patrick", "speaker_handle": "+15550000001"}
+    with pytest.raises(RuntimeError):
+        await module._capture_people_turn(adapter, adapter._chats["cht_b"], turn)
+    assert written == []
+
+
+_STORE_DIR = "/Users/sam/Library/Application Support/AddressBook"
+_STORES = [f"{_STORE_DIR}/AddressBook-v22.abcddb", f"{_STORE_DIR}/Sources/ABCD-1/AddressBook-v22.abcddb"]
+# The shape of Latch's real contacts skill: the resolved ROOT store, bare and
+# inside a recipe's argv; the sync-source stores are left to a find; and a
+# `~/…/` literal that is prose, not a path.
+_SKILL_BODY = ("# The owner's contacts are on this Mac\n\nThere is more than one store. The root one:\n\n"
+               f"    {_STORES[0]}\n\nplus one per sync source under `Sources/<UUID>/`. Sweep them all first:\n\n"
+               f'    plow_run_command {{ argv: ["/usr/bin/find", "{_STORE_DIR}", "-maxdepth", "4", "-name", '
+               '"AddressBook*.abcddb"] }\n\n'
+               f'    plow_run_command {{ argv: ["/usr/bin/sqlite3", "-readonly", "-header", "-csv", "{_STORES[0]}", '
+               '"select count(*) from ZABCDRECORD;"] }\n\n'
+               "a literal `~/…/AddressBook-v22.abcddb` argument would fail to open.")
+
+
+def test_the_store_directory_comes_from_the_contacts_skill(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert module._contacts_store_dir(_SKILL_BODY) == _STORE_DIR
+    with pytest.raises(ValueError):
+        module._contacts_store_dir("# a skill that names no store")
+
+
+@pytest.mark.parametrize("rows, expected", [
+    # Half the store is "(714) 393-3614"-shaped: digits decide, and a leading 1 is not a difference.
+    ([{"name": "Patrick Salyer", "phone": "(714) 393-3614", "email": None}],
+     {"+17143933614": "Patrick Salyer"}),
+    # Two records share a number: nobody is named.
+    ([{"name": "Patrick Salyer", "phone": "+17143933614", "email": None},
+      {"name": "P. Salyer", "phone": "+1 714 393 3614", "email": None}], {}),
+    # Emails match case-folded; one record with two rows is still one record.
+    ([{"name": "Chu", "phone": None, "email": "CMchu@x.com"},
+      {"name": "Chu", "phone": "+15550001111", "email": None}],
+     {"cmchu@x.com": "Chu"}),
+    # The same card in the root store and its iCloud source is one person; a nameless company card is nobody.
+    ([{"name": "Patrick Salyer", "phone": "+17143933614", "email": None},
+      {"name": "Patrick Salyer", "phone": "(714) 393-3614", "email": None},
+      {"name": "", "phone": "+17143933614", "email": None}],
+     {"+17143933614": "Patrick Salyer"}),
+    ([], {}),
+])
+def test_a_handle_resolves_only_to_exactly_one_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, rows: list[dict[str, Any]], expected: dict[str, str]
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert module._resolve_handles(rows, ["+17143933614", "cmchu@x.com"]) == expected
+
+
+async def test_bare_handles_are_named_from_the_owners_mac_after_a_reach_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The listing showed a handle; the owner's own Contacts know the name;
+    nobody had to ask. Ambiguous and already-named rows are left alone, and
+    the Mac being unreachable costs nothing but a log line."""
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.setenv("PLOW_MCP_URL", "https://relay.example/mcp")
+    monkeypatch.setenv("PLOW_AGENT_TOKEN", "t")
+    relay_calls: list[tuple[str, dict[str, Any]]] = []
+    book = [{"provider_key": "+15550000001", "display_name": "Sam", "relationship": None, "role": "owner"}]
+
+    def relay(url: str, token: str, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+        relay_calls.append((name, arguments))
+        if name == "plow_read_skill":
+            return {"body": _SKILL_BODY}
+        if arguments["argv"][0] == "/usr/bin/find":
+            return {"status": "completed", "exit_code": 0, "output": "\n".join(_STORES) + "\n"}
+        if arguments["argv"][3] == _STORES[1]:   # a sync source on another schema version: skipped, not fatal
+            return {"status": "completed", "exit_code": 1, "output": "Parse error: no such column: ZOWNER\n"}
+        # While the Mac answers, a turn's capture names Dana from her own words:
+        # the card fills an empty row only, so hers is left as she gave it.
+        book.append({"provider_key": "+15559990000", "display_name": "Dana", "relationship": None, "role": "member"})
+        rows = [{"name": "Patrick Salyer", "phone": "+17143933614", "email": None},
+                {"name": "Dana Quinn", "phone": "+15559990000", "email": None}]
+        return {"status": "completed", "exit_code": 0, "output": json.dumps(rows)}
+
+    monkeypatch.setattr(module, "_relay_call", relay)
+    adapter, written = _people_adapter(module, monkeypatch, [_chat("cht_a")], book)
+    chat = _chat("cht_b", group=True)
+    chat["participants"][2]["provider_key"] = "+17143933614"
+    chat["participants"].append({"type": "member", "uid": "mem_chu_cht_b", "role": "member",
+                                 "display_name": "Chu", "provider_key": "+15550000003"})
+    chat["participants"].append({"type": "member", "uid": "mem_dana_cht_b", "role": "member",
+                                 "provider_key": "+15559990000"})
+    done = threading.Event()
+    monkeypatch.setattr(module, "_backfill_done", done.set)   # test seam: fires after the thread finishes
+    monkeypatch.setattr(module, "_backfill", {"tried_at": 0.0, "lock": threading.Lock()})
+    adapter._set_reach([_chat("cht_a"), chat])
+    await asyncio.get_running_loop().run_in_executor(None, done.wait, 5)
+    assert written == [("+17143933614", {"display_name": "Patrick Salyer"})]
+    assert [name for name, _ in relay_calls] == ["plow_read_skill"] + ["plow_run_command"] * 3
+    sweep, *queries = (arguments for _, arguments in relay_calls[1:])
+    assert sweep["argv"][:2] == ["/usr/bin/find", _STORE_DIR]
+    assert [q["argv"][:4] for q in queries] == [["/usr/bin/sqlite3", "-readonly", "-json", s] for s in _STORES]
+    # The query carries the bare handle's digits -- not a wildcard sweep, and
+    # never the owner's or an already-named member's: empty names only.
+    sql = queries[0]["argv"][-1]
+    assert "3933614" in sql and "9990000" in sql and "0000001" not in sql and "0000003" not in sql
+    # What the owner's approval dialog, the adversarial reviewer and the audit log show.
+    assert all(a["read_paths"] == [_STORE_DIR] and a["goal"] == module.BACKFILL_GOAL for a in (sweep, *queries))
+    # The listing tool refreshes reach on every call; within BACKFILL_RETRY_S the Mac is not asked again.
+    tried_at = module._backfill["tried_at"]
+    adapter._set_reach([_chat("cht_a"), chat])
+    assert module._backfill["tried_at"] == tried_at and len(relay_calls) == 4
+
+
+def _mac_offline(*a: Any, **k: Any) -> dict[str, Any]:
+    raise OSError("mac offline")
+
+
+def _mac_without_stores(url: str, token: str, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+    if name == "plow_read_skill":
+        return {"body": _SKILL_BODY}
+    return {"status": "completed", "exit_code": 1, "output": f"find: {_STORE_DIR}: No such file or directory\n"}
+
+
+@pytest.mark.parametrize("relay", [_mac_offline, _mac_without_stores])
+async def test_backfill_leaves_the_listing_alone_when_the_mac_cannot_answer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, relay: Any
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.setenv("PLOW_MCP_URL", "https://relay.example/mcp")
+    monkeypatch.setenv("PLOW_AGENT_TOKEN", "t")
+    monkeypatch.setattr(module, "_relay_call", relay)
+    adapter, written = _people_adapter(module, monkeypatch, [_chat("cht_a")], [])
+    done = threading.Event()
+    monkeypatch.setattr(module, "_backfill_done", done.set)
+    monkeypatch.setattr(module, "_backfill", {"tried_at": 0.0, "lock": threading.Lock()})
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    await asyncio.get_running_loop().run_in_executor(None, done.wait, 5)
+    assert written == []
+    assert set(adapter.chat_uids) == {"cht_a", "cht_b"}
+
+
 def _authority_case_read_the_book(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
     """The mirror of naming's gate: a no-turn cron caller reads, where it refuses to write."""
     record: list[Any] = []
@@ -3078,6 +3436,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "recall_everywhere": False,
         "no_reply_ok": False,
         "recall_text": None,
+        "speaker_handle": "+17035550123",
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
         "source_message_id": "msg_delight_1",
@@ -3192,7 +3551,7 @@ def test_invite_workflow_reports_delivery_failure(
             None,
             "missing",
             {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False, "recall_everywhere": False,
-             "no_reply_ok": False, "recall_text": None,
+             "no_reply_ok": False, "recall_text": None, "speaker_handle": None,
              "source_message_id": "msg_delight_1", "owner_handle": "+15550000001"},
             id="missing-participant",
         ),
@@ -3223,6 +3582,7 @@ def test_invite_workflow_reports_delivery_failure(
                 participant_identity="+17035550124",
                 triggered_at=mock.ANY,
                 owner_handle="+15550000001",
+                speaker_handle="+17035550124",
             ),
             id="phone-fallback",
         ),
@@ -8021,7 +8381,7 @@ async def test_a_later_turn_start_does_not_strip_the_running_turn(monkeypatch, t
     assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, first))['success']
 
     event = SimpleNamespace(
-        source=SimpleNamespace(chat_id='cht_a', role_authorized=True, chat_type='dm'),
+        source=SimpleNamespace(chat_id='cht_a', role_authorized=True, chat_type='dm', user_id='owner'),
         channel_prompt='', message_id='', text='', authority=True, recall_everywhere=True)
     await adapter.on_processing_start(event)
     second = adapter._active_turn.get()
