@@ -261,10 +261,21 @@ def _owner_participant(chat):
 
 def _owner_handle(chat):
     """The owner's own handle off this chat's roster, or None when the chat
-    carries no owner participant. What `_plow_name_contact` compares a turn's
-    write target against to refuse a non-owner turn renaming the owner."""
+    carries no owner participant. Stamped onto every turn, owner or member,
+    so `_admit_people_facts`'s provenance rule can tell the owner's own
+    handle from anyone else's -- a relationship never lands on it, set or
+    cleared, and a member's word never reaches it."""
     owner = _owner_participant(chat)
     return owner.get("provider_key") if owner else None
+
+
+def _speaker_participant(chat, user_id):
+    """The member who spoke on this turn, off the chat's roster, or None on a
+    wake or setup turn, which has no speaker to learn anything from. Both
+    lines stamp its handle as the turn's `speaker_handle`, the key
+    `_may_write_contact_field` lets a member's word reach."""
+    return next((p for p in chat.get("participants") or []
+                 if p.get("type") == "member" and p.get("uid") == user_id), None)
 
 
 def _handle_key(handle):
